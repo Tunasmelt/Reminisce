@@ -1,71 +1,44 @@
 import { getServiceSupabase } from '@/lib/supabase'
+import { getModel, getModelByIdLoose } from '@/lib/model-registry'
 
 // ─── MODEL COSTS ──────────────────────────────
-// coin  = free tier (any user)
-// gem   = premium tier (pro users only)
+// Cost/tier are derived from the model-registry (the single provider_models
+// reader — one cache, one owner). Lookups prefer the authoritative key
+// (provider, model_id); callers that don't have the provider in scope fall back
+// to a model_id-only lookup that warns on cross-provider ambiguity.
 
-export const MODEL_COSTS: Record<string, {
+// ── E-22: Process-local daily-reset memo ───────────────────────────────────
+// Tracks the UTC date (YYYY-MM-DD) on which applyDailyReset last confirmed a
+// reset (or that today's reset already ran) for each userId. When 50 rapid
+// wizard messages hit the same warm serverless function instance, only the
+// FIRST call does the DB round-trip; the rest short-circuit here.
+//
+// This is process-local — each serverless function instance has its own copy.
+// The memo is automatically valid only for today: the date string changes at
+// UTC midnight, automatically expiring stale entries.
+const _resetMemo = new Map<string, string>() // userId → 'YYYY-MM-DD'
+
+export async function getModelCostInfo(
+  model: string,
+  provider?: string,
+): Promise<{
   currency: 'coins' | 'gems'
   amount: number
   tier: 'free' | 'pro'
-}> = {
-  // ── FREE TIER (Groq) — fastest, most reliable free inference ──────────
-  'llama-3.1-8b-instant':              { currency: 'coins', amount: 1, tier: 'free' },
-  'llama-3.3-70b-versatile':           { currency: 'coins', amount: 2, tier: 'free' },
-  'gemma2-9b-it':                      { currency: 'coins', amount: 1, tier: 'free' },
-  'llama-3.2-3b-preview':              { currency: 'coins', amount: 1, tier: 'free' },
-  'mixtral-8x7b-32768':                { currency: 'coins', amount: 2, tier: 'free' },
-  'qwen-2.5-coder-32b':                { currency: 'coins', amount: 1, tier: 'free' },
-
-  // ── FREE TIER (Cerebras) — ultra-fast inference ───────────────────────
-  'llama3.1-8b':                       { currency: 'coins', amount: 1, tier: 'free' },
-  'llama-3.3-70b':                     { currency: 'coins', amount: 2, tier: 'free' },
-
-  // ── FREE TIER (Gemini) — Google's free quota ──────────────────────────
-  'gemini-2.0-flash':                  { currency: 'coins', amount: 2, tier: 'free' },
-  'gemini-1.5-flash':                  { currency: 'coins', amount: 1, tier: 'free' },
-  'gemini-1.5-flash-8b':               { currency: 'coins', amount: 1, tier: 'free' },
-  'gemini-1.5-flash-lite':             { currency: 'coins', amount: 1, tier: 'free' },
-
-  // ── FREE TIER (Mistral) — Mistral free API ───────────────────────────
-  'open-mistral-7b':                   { currency: 'coins', amount: 1, tier: 'free' },
-  'mistral-small-latest':              { currency: 'coins', amount: 2, tier: 'free' },
-
-  // ── FREE TIER (OpenRouter confirmed working) ──────────────────────────
-  // Only models confirmed available as of April 2026
-  'meta-llama/llama-3.3-70b-instruct:free':          { currency: 'coins', amount: 2, tier: 'free' },
-  'meta-llama/llama-3.1-8b-instruct:free':           { currency: 'coins', amount: 1, tier: 'free' },
-  'google/gemma-3-12b-it:free':                      { currency: 'coins', amount: 1, tier: 'free' },
-  'mistralai/mistral-7b-instruct:free':          { currency: 'coins', amount: 1, tier: 'free' },
-  'qwen/qwen-2.5-72b-instruct:free':                 { currency: 'coins', amount: 2, tier: 'free' },
-  'microsoft/phi-3-mini-128k-instruct:free':         { currency: 'coins', amount: 1, tier: 'free' },
-  'deepseek/deepseek-chat:free':                     { currency: 'coins', amount: 2, tier: 'free' },
-  'nousresearch/hermes-3-llama-3.1-405b:free':       { currency: 'coins', amount: 2, tier: 'free' },
-  'liquid/lfm-40b:free':                             { currency: 'coins', amount: 1, tier: 'free' },
-
-  // ── PRO TIER (Anthropic) ─────────────────────────────────────────────
-  'claude-haiku-4-5':                  { currency: 'gems', amount: 1, tier: 'pro' },
-  'claude-3-5-haiku-20241022':         { currency: 'gems', amount: 1, tier: 'pro' },
-  'claude-sonnet-4-20250514':          { currency: 'gems', amount: 3, tier: 'pro' },
-  'claude-3-5-sonnet-20241022':        { currency: 'gems', amount: 3, tier: 'pro' },
-
-  // ── PRO TIER (OpenAI) ────────────────────────────────────────────────
-  'gpt-4o-mini':                       { currency: 'gems', amount: 1, tier: 'pro' },
-  'gpt-4o':                            { currency: 'gems', amount: 3, tier: 'pro' },
-  'gpt-4o-mini-2024-07-18':            { currency: 'gems', amount: 1, tier: 'pro' },
-
-  // ── PRO TIER (Gemini paid) ───────────────────────────────────────────
-  'gemini-2.5-flash':                  { currency: 'gems', amount: 2, tier: 'pro' },
-  'gemini-2.5-pro':                    { currency: 'gems', amount: 4, tier: 'pro' },
-  'gemini-1.5-pro':                    { currency: 'gems', amount: 2, tier: 'pro' },
-
-  // ── PRO TIER (Mistral paid) ──────────────────────────────────────────
-  'mistral-large-latest':              { currency: 'gems', amount: 2, tier: 'pro' },
-  'codestral-latest':                  { currency: 'gems', amount: 2, tier: 'pro' },
-
-  // ── PRO TIER (OpenRouter paid) ───────────────────────────────────────
-  'anthropic/claude-3-5-sonnet':       { currency: 'gems', amount: 3, tier: 'pro' },
-  'openai/gpt-4o':                     { currency: 'gems', amount: 3, tier: 'pro' },
+}> {
+  const row = provider
+    ? await getModel(provider, model)
+    : await getModelByIdLoose(model)
+  if (!row) {
+    // E-10: Unknown model — warn so mis-spellings/disabled models are detectable
+    console.warn(`[wallet] getModelCostInfo: model "${model}" not found in provider_models — charging 1 coin as fallback`)
+    return { currency: 'coins', amount: 1, tier: 'free' }
+  }
+  const isPro = row.tier_required === 'pro' || !row.is_free
+  if (!isPro) {
+    return { currency: 'coins', amount: row.cost_coins ?? 1, tier: 'free' }
+  }
+  return { currency: 'gems', amount: row.cost_gems ?? 3, tier: 'pro' }
 }
 
 // ─── PLAN HELPERS ─────────────────────────────
@@ -85,11 +58,13 @@ export async function getUserPlan(
     .select('plan, status, projects_limit')
     .eq('user_id', userId)
     .single()
-  return data || { 
-    plan: 'free', 
-    status: 'active', 
-    projects_limit: 2 
+  if (!data) {
+    // E-9: Missing plan row means handle_new_user trigger didn't fire (rare).
+    // Defaulting to free so the user isn't silently blocked. Warn so it's
+    // visible in server logs — the user may actually be Pro.
+    console.warn(`[wallet] getUserPlan: no user_plans row for ${userId} — defaulting to free`)
   }
+  return data || { plan: 'free', status: 'active', projects_limit: 2 }
 }
 
 export async function canCreateProject(
@@ -156,6 +131,13 @@ export async function getWallet(
   }
 }
 
+/**
+ * Ensures a wallet row exists for the given user.
+ * W-6: Uses ignoreDuplicates: true — this function is CREATE-only, not UPDATE.
+ * If a wallet row already exists the upsert is a no-op regardless of the
+ * `plan` argument. Do NOT call this to upgrade an existing user's limits;
+ * use a direct UPDATE on user_wallets (as admin upgrade_pro / downgrade_free do).
+ */
 export async function ensureWallet(
   userId: string,
   plan: 'free' | 'pro' = 'free'
@@ -171,9 +153,9 @@ export async function ensureWallet(
       daily_coins_limit: isProPlan ? 200 : 50,
       max_coins_banked: isProPlan ? 500 : 200,
       gems_monthly_grant: isProPlan ? 100 : 0,
-    }, { 
+    }, {
       onConflict: 'user_id',
-      ignoreDuplicates: true 
+      ignoreDuplicates: true,  // intentional: only creates, never overwrites existing limits
     })
 }
 
@@ -206,53 +188,90 @@ export function getTimeUntilUTCReset(): string {
 export async function applyDailyReset(
   userId: string
 ): Promise<void> {
+  const now = new Date()
+  const todayKey = `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, '0')}-${String(now.getUTCDate()).padStart(2, '0')}`
+
+  // W-7: Prune stale memo entries at midnight boundary to prevent unbounded
+  // growth within a long-lived serverless instance. Entries from previous days
+  // are safe to evict — the todayKey has changed, so they'll be re-evaluated.
+  if (_resetMemo.size > 500) {
+    for (const [uid, date] of Array.from(_resetMemo.entries())) {
+      if (date !== todayKey) _resetMemo.delete(uid)
+    }
+  }
+
+  // E-22: Process-local fast path — skip DB entirely if this instance already
+  // confirmed today's reset for this user.
+  if (_resetMemo.get(userId) === todayKey) return
+
   const supabase = getServiceSupabase()
   const wallet = await getWallet(userId)
-  
+
   const lastReset = wallet.coins_last_reset
     ? new Date(wallet.coins_last_reset)
     : new Date(0)
-  
-  const now = new Date()
+
   const todayUTC = new Date(
-    Date.UTC(
-      now.getUTCFullYear(),
-      now.getUTCMonth(),
-      now.getUTCDate()
-    )
+    Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate())
   )
-  
-  // If last reset was before today UTC, reset
-  if (lastReset < todayUTC) {
-    const newCoins = Math.max(
-      wallet.coins,
-      wallet.daily_coins_limit
+
+  // Fast path: already reset today — memo and skip the DB write entirely
+  if (lastReset >= todayUTC) {
+    _resetMemo.set(userId, todayKey)
+    return
+  }
+
+  // E-21: Warn when a misconfigured daily_limit exceeds max_coins_banked.
+  // The cap below is still applied correctly, but the discrepancy means the
+  // user's reset won't reach their intended daily limit — visible in logs.
+  if (wallet.daily_coins_limit > wallet.max_coins_banked) {
+    console.warn(
+      `[wallet] applyDailyReset: daily_coins_limit (${wallet.daily_coins_limit}) > max_coins_banked (${wallet.max_coins_banked}) for user ${userId} — reset will be capped at max_coins_banked`
     )
-    const capped = Math.min(
-      newCoins,
-      wallet.max_coins_banked
-    )
-    await supabase
-      .from('user_wallets')
-      .update({ 
-        coins: capped,
-        coins_last_reset: now.toISOString(),
-        updated_at: now.toISOString(),
+  }
+  const newCoins = Math.max(wallet.coins, wallet.daily_coins_limit)
+  const capped   = Math.min(newCoins, wallet.max_coins_banked)
+  const todayISO = todayUTC.toISOString()
+
+  // ── E-2: Atomic reset via DB-level filter ────────────────────────────────
+  // The UPDATE only fires if coins_last_reset is still before today at write
+  // time. Two concurrent requests that both pass the fast-path check above
+  // will race on this UPDATE; only the first will match the filter and win.
+  // The second sees 0 rows returned and stops — preventing a double grant.
+  const { data: resetResult } = await supabase
+    .from('user_wallets')
+    .update({
+      coins:            capped,
+      coins_last_reset: now.toISOString(),
+      updated_at:       now.toISOString(),
+    })
+    .eq('user_id', userId)
+    .or(`coins_last_reset.is.null,coins_last_reset.lt.${todayISO}`)
+    .select('id')
+
+  if (!resetResult || resetResult.length === 0) {
+    // Lost the race to another concurrent request — memo today so we stop retrying
+    _resetMemo.set(userId, todayKey)
+    return
+  }
+  // Won the race — memo today's date so subsequent calls skip the DB entirely
+  _resetMemo.set(userId, todayKey)
+
+  // Log the reset only when coins actually increased
+  if (capped - wallet.coins > 0) {
+    // E-17: Check the insert result so a log failure surfaces in server logs.
+    const { error: txErr } = await supabase
+      .from('wallet_transactions')
+      .insert({
+        user_id:            userId,
+        type:               'credit',
+        amount:             capped - wallet.coins,
+        currency:           'coins',
+        description:        'Daily coin reset',
+        transaction_source: 'daily_reset',
       })
-      .eq('user_id', userId)
-    
-    // Log reset transaction
-    if (capped - wallet.coins > 0) {
-      await supabase
-        .from('wallet_transactions')
-        .insert({
-          user_id: userId,
-          type: 'credit',
-          amount: capped - wallet.coins,
-          currency: 'coins',
-          description: 'Daily coin reset',
-          transaction_source: 'daily_reset',
-        })
+    if (txErr) {
+      console.error('[wallet] applyDailyReset: transaction log insert failed (reset still applied):', txErr.message)
     }
   }
 }
@@ -262,7 +281,8 @@ export async function applyDailyReset(
 export async function deductCost(
   userId: string,
   model: string,
-  runId?: string
+  runId?: string,
+  provider?: string,
 ): Promise<{
   success: boolean
   message?: string
@@ -271,11 +291,9 @@ export async function deductCost(
 }> {
   // Apply daily reset before checking balance
   await applyDailyReset(userId)
-  
-  const cost = MODEL_COSTS[model] 
-    ?? { currency: 'coins' as const, 
-         amount: 1, tier: 'free' as const }
-  
+
+  const cost = await getModelCostInfo(model, provider)
+
   // Check if user is allowed to use gem models
   if (cost.tier === 'pro') {
     const plan = await getUserPlan(userId)
@@ -286,50 +304,75 @@ export async function deductCost(
       }
     }
   }
-  
+
   const supabase = getServiceSupabase()
-  const wallet = await getWallet(userId)
-  
-  const balance = cost.currency === 'gems'
-    ? wallet.gems
-    : wallet.coins
-    
-  if (balance < cost.amount) {
+  const costField = cost.currency === 'gems' ? 'gems' : 'coins'
+  const now = new Date().toISOString()
+
+  // ── E-1: Atomic deduction via optimistic locking ──────────────────────────
+  // Read the current balance for the snapshot, then UPDATE only if the balance
+  // is still that exact value at write time. If a concurrent request already
+  // deducted, the WHERE coins = snapshot fails → 0 rows → we retry once with
+  // a fresh read. This prevents two concurrent calls from both passing a
+  // balance check and both deducting, which would send the balance negative.
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const wallet = await getWallet(userId)
+    const balance = cost.currency === 'gems' ? wallet.gems : wallet.coins
+
+    if (balance < cost.amount) {
+      const msg = cost.currency === 'gems'
+        ? `Not enough gems. You have ${wallet.gems} gems. Pro subscribers receive 100 gems/month.`
+        : `Not enough coins. You have ${wallet.coins} coins. Your daily allowance resets ${getTimeUntilUTCReset()} (midnight UTC). Note: individual AI provider quotas may reset at different times.`
+      return { success: false, message: msg }
+    }
+
+    const updateField = cost.currency === 'gems'
+      ? { gems: balance - cost.amount, updated_at: now }
+      : { coins: balance - cost.amount, updated_at: now }
+
+    // Optimistic lock: only commit if balance hasn't changed since we read it.
+    const { data: updated } = await supabase
+      .from('user_wallets')
+      .update(updateField)
+      .eq('user_id', userId)
+      .eq(costField, balance)   // guard: only update if snapshot still matches
+      .select('id')
+
+    if (updated && updated.length > 0) {
+      // Deduction succeeded — log the transaction
+      // E-15: Check the insert result so a log failure surfaces in server logs
+      // rather than silently breaking the audit trail.
+      const { error: txErr } = await supabase
+        .from('wallet_transactions')
+        .insert({
+          user_id:            userId,
+          type:               'debit',
+          amount:             -cost.amount,
+          currency:           cost.currency,
+          model_used:         model,
+          run_id:             runId || null,
+          description:        `Agent run: ${model}`,
+          transaction_source: 'run',
+        })
+      if (txErr) {
+        console.error('[wallet] deductCost: transaction log insert failed (deduction still applied):', txErr.message)
+      }
+      return { success: true, currency: cost.currency, amount: cost.amount }
+    }
+    // Concurrent modification — retry once with a fresh balance read
+  }
+
+  // Both attempts lost the optimistic lock — re-read for accurate error message
+  const finalWallet = await getWallet(userId)
+  const finalBalance = cost.currency === 'gems' ? finalWallet.gems : finalWallet.coins
+  if (finalBalance < cost.amount) {
     const msg = cost.currency === 'gems'
-      ? `Not enough gems. You have ${wallet.gems} gems. Pro subscribers receive 100 gems/month.`
-      : `Not enough coins. You have ${wallet.coins} coins. Your daily allowance resets ${getTimeUntilUTCReset()} (midnight UTC). Note: individual AI provider quotas may reset at different times.`
+      ? `Not enough gems. You have ${finalWallet.gems} gems. Pro subscribers receive 100 gems/month.`
+      : `Not enough coins. You have ${finalWallet.coins} coins. Your daily allowance resets ${getTimeUntilUTCReset()} (midnight UTC).`
     return { success: false, message: msg }
   }
-  
-  const updateField = cost.currency === 'gems'
-    ? { gems: wallet.gems - cost.amount,
-        updated_at: new Date().toISOString() }
-    : { coins: wallet.coins - cost.amount,
-        updated_at: new Date().toISOString() }
-    
-  await supabase
-    .from('user_wallets')
-    .update(updateField)
-    .eq('user_id', userId)
-  
-  await supabase
-    .from('wallet_transactions')
-    .insert({
-      user_id: userId,
-      type: 'debit',
-      amount: -cost.amount,
-      currency: cost.currency,
-      model_used: model,
-      run_id: runId || null,
-      description: `Agent run: ${model}`,
-      transaction_source: 'run',
-    })
-  
-  return { 
-    success: true, 
-    currency: cost.currency,
-    amount: cost.amount 
-  }
+  // Extremely rare: lost both attempts but balance is sufficient — fail safe
+  return { success: false, message: 'Wallet update conflict. Please try again.' }
 }
 
 // ─── REFUND ───────────────────────────────────
@@ -338,43 +381,84 @@ export async function refundCost(
   userId: string,
   model: string,
   runId?: string,
+  provider?: string,
 ): Promise<void> {
+  // W-9: The unique constraint on wallet_transactions (run_id, type='refund')
+  // is the idempotency sentinel for this function. In PostgreSQL, NULL values
+  // are never considered equal in a unique index — so (NULL, 'refund') is
+  // distinct from every other (NULL, 'refund') row. This means every call
+  // without a runId bypasses the duplicate guard and creates a new refund row,
+  // potentially crediting the user multiple times.
+  //
+  // If runId is missing, generate a stable synthetic key from userId + model +
+  // the current minute so that rapid retries within the same minute are
+  // deduplicated, but a genuinely new charge in the next minute can still be
+  // refunded. This is imperfect (two distinct charges in the same minute on the
+  // same model for the same user would deduplicate), but is far safer than the
+  // unlimited-duplicate behaviour of null.
+  const effectiveRunId = runId || `synthetic-${userId}-${model}-${Math.floor(Date.now() / 60_000)}`
+
   const attemptRefund = async () => {
-    const cost = MODEL_COSTS[model]
+    const cost = await getModelCostInfo(model, provider)
     if (!cost) return
     const supabase = getServiceSupabase()
-    const wallet = await getWallet(userId)
+    const now = new Date().toISOString()
 
-    const updateField = cost.currency === 'gems'
-      ? {
-          gems: wallet.gems + cost.amount,
-          updated_at: new Date().toISOString(),
-        }
-      : {
-          coins: Math.min(
-            wallet.coins + cost.amount,
-            wallet.max_coins_banked,
-          ),
-          updated_at: new Date().toISOString(),
-        }
-
-    await supabase
-      .from('user_wallets')
-      .update(updateField)
-      .eq('user_id', userId)
-
-    await supabase
+    // W-2 + W-3: Flip order — insert the transaction log row FIRST so it acts
+    // as the atomic idempotency sentinel. The unique index on (run_id, type='refund')
+    // ensures only one concurrent call can insert; the second gets a conflict error
+    // (code 23505) and aborts before touching the wallet. This closes the TOCTOU
+    // gap that existed when the count-check and wallet-update were separate steps.
+    const { error: txErr } = await supabase
       .from('wallet_transactions')
       .insert({
-        user_id: userId,
-        type: 'refund',
-        amount: cost.amount,
-        currency: cost.currency,
-        model_used: model,
-        run_id: runId || null,
-        description: 'Refund: run failed',
+        user_id:            userId,
+        type:               'refund',
+        amount:             cost.amount,
+        currency:           cost.currency,
+        model_used:         model,
+        run_id:             effectiveRunId,
+        description:        'Refund: run failed',
         transaction_source: 'refund',
       })
+
+    if (txErr) {
+      // Unique constraint violation — already refunded for this runId, skip.
+      if (txErr.code === '23505') {
+        console.warn('[wallet] refundCost: duplicate refund attempt blocked for runId', effectiveRunId)
+        return
+      }
+      // Other DB error — log and let the retry handler deal with it.
+      console.error('[wallet] refundCost: transaction log insert failed:', txErr.message)
+      throw new Error(txErr.message)
+    }
+
+    // W-3: Optimistic locking on wallet update — mirrors deductCost's 2-attempt
+    // pattern. Prevents a concurrent deduction from being silently overwritten
+    // by a plain read-then-write refund.
+    const costField = cost.currency === 'gems' ? 'gems' : 'coins'
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const wallet = await getWallet(userId)
+      const currentBalance = cost.currency === 'gems' ? wallet.gems : wallet.coins
+
+      const updateField = cost.currency === 'gems'
+        ? { gems: currentBalance + cost.amount, updated_at: now }
+        : { coins: Math.min(currentBalance + cost.amount, wallet.max_coins_banked), updated_at: now }
+
+      const { data: updated } = await supabase
+        .from('user_wallets')
+        .update(updateField)
+        .eq('user_id', userId)
+        .eq(costField, currentBalance)   // optimistic lock: only commit if balance unchanged
+        .select('id')
+
+      if (updated && updated.length > 0) return  // succeeded
+      // Lost the lock to a concurrent write — retry once with a fresh read
+    }
+
+    // Both attempts lost the optimistic lock — log and let caller retry.
+    console.error('[wallet] refundCost: optimistic lock failed after 2 attempts for user', userId)
+    throw new Error('Wallet update conflict during refund')
   }
 
   // Attempt once, then retry once after a short delay before giving up.
@@ -405,73 +489,82 @@ export async function awardCoins(
   event: RewardEvent,
   referenceId?: string // projectId for per-project events
 ): Promise<{ awarded: boolean; amount: number }> {
+  // E-18: Wallet update and transaction log are separated into two independent
+  // steps so a log insert failure doesn't falsely report { awarded: false }
+  // when coins were already credited to the wallet.
   try {
     const supabase = getServiceSupabase()
-    
+
     const REWARDS: Record<RewardEvent, number> = {
       wizard_complete: 25,
       first_agent_run: 15,
-      daily_login: 10,
-      save_context: 5,
+      daily_login:     10,
+      save_context:     5,
     }
-    
+
     const amount = REWARDS[event]
-    
-    // Check if this reward was already given
-    const query = supabase
-      .from('wallet_transactions')
-      .select('id', { count: 'exact', head: true })
-      .eq('user_id', userId)
-      .eq('transaction_source', event)
 
-    if (referenceId) {
-      query.eq('metadata->>referenceId', referenceId)
-    }
-
-    if (event === 'daily_login' || event === 'save_context') {
-      const today = new Date(Date.UTC(
-          new Date().getUTCFullYear(),
-          new Date().getUTCMonth(),
-          new Date().getUTCDate()
-      )).toISOString()
-      query.gte('created_at', today)
-    }
-    
-    const { count } = await query
-    
-    if ((count || 0) > 0) {
-      return { awarded: false, amount: 0 }
-    }
-    
-    const wallet = await getWallet(userId)
-    const newCoins = Math.min(
-      wallet.coins + amount,
-      wallet.max_coins_banked
-    )
-    
-    await supabase
-      .from('user_wallets')
-      .update({ 
-        coins: newCoins,
-        updated_at: new Date().toISOString(),
-      })
-      .eq('user_id', userId)
-    
-    await supabase
+    // ── W-1: Flip order — insert the transaction log FIRST as the idempotency
+    // sentinel. The unique indices on wallet_transactions ensure only one
+    // concurrent call can insert for the same (user, event, referenceId/day).
+    // The second concurrent call hits a unique constraint violation (code 23505)
+    // and returns {awarded: false} immediately — before any wallet update.
+    // This closes the TOCTOU gap where both concurrent calls passed the old
+    // count-check before either inserted the log row.
+    const { error: txErr } = await supabase
       .from('wallet_transactions')
       .insert({
-        user_id: userId,
-        type: 'credit',
+        user_id:            userId,
+        type:               'credit',
         amount,
-        currency: 'coins',
-        description: `Reward: ${event.replace('_', ' ')}`,
+        currency:           'coins',
+        description:        `Reward: ${event.replace(/_/g, ' ')}`,
         transaction_source: event,
-        metadata: { referenceId: referenceId || '' },
+        metadata:           { referenceId: referenceId || '' },
       })
-    
-    return { awarded: true, amount }
+
+    if (txErr) {
+      if (txErr.code === '23505') {
+        // Unique constraint hit — reward already granted, skip silently.
+        return { awarded: false, amount: 0 }
+      }
+      console.warn('[wallet] awardCoins: transaction log insert failed:', txErr.message)
+      return { awarded: false, amount: 0 }
+    }
+
+    // ── W-4: Optimistic locking on wallet credit — mirrors deductCost's
+    // 2-attempt pattern. Prevents concurrent awards for different events
+    // (e.g. daily_login + save_context firing simultaneously) from racing
+    // on the balance update and silently losing one increment.
+    let awarded = false
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const wallet   = await getWallet(userId)
+      const newCoins = Math.min(wallet.coins + amount, wallet.max_coins_banked)
+
+      const { data: updated } = await supabase
+        .from('user_wallets')
+        .update({ coins: newCoins, updated_at: new Date().toISOString() })
+        .eq('user_id', userId)
+        .eq('coins', wallet.coins)   // optimistic lock: only commit if balance unchanged
+        .select('id')
+
+      if (updated && updated.length > 0) { awarded = true; break }
+      // Concurrent modification — retry once with fresh balance read
+    }
+
+    if (!awarded) {
+      // Both attempts lost the lock — coins are slightly delayed but the
+      // transaction log row already exists so no double-award is possible.
+      // W-8: Return awarded:false so callers know the wallet update failed,
+      // even though the transaction log sentinel was inserted. The transaction
+      // log prevents any retry from double-crediting — coins are permanently
+      // undelivered if both lock attempts fail, which is acceptable at scale.
+      console.warn('[wallet] awardCoins: optimistic lock failed after 2 attempts for user', userId, event)
+    }
+
+    return { awarded, amount }
   } catch (err) {
-    console.warn('Award coins failed:', err)
+    console.warn('[wallet] awardCoins failed:', err)
     return { awarded: false, amount: 0 }
   }
 }

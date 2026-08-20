@@ -1,6 +1,8 @@
 import { NextResponse } from 'next/server'
 import { verifyAdmin } from '@/lib/admin-auth'
 import { getServiceSupabase } from '@/lib/supabase'
+import { invalidateModelCache } from '@/lib/ai-client'
+import { writeAuditLog } from '@/lib/admin-audit'
 
 export const dynamic = 'force-dynamic'
 
@@ -11,10 +13,20 @@ export async function PATCH(
   const check = await verifyAdmin(req.headers.get('authorization'))
   if (!check.ok) return check.response
 
-  const body = await req.json()
+  let body: Record<string, unknown>
+  try {
+    body = await req.json()
+  } catch {
+    return NextResponse.json({ error: 'Invalid JSON body' }, { status: 400 })
+  }
   const sb = getServiceSupabase()
 
-  const allowed = ['label', 'enabled', 'is_free', 'tier_required', 'sort_order', 'notes', 'model_name']
+  const allowed = [
+    'label', 'enabled', 'visible', 'is_free', 'tier_required',
+    'sort_order', 'notes', 'model_name',
+    'cost_coins', 'cost_gems', 'context_window',
+    'rate_limit_rpm', 'rate_limit_rpd',
+  ]
   const updates: Record<string, unknown> = {}
   for (const key of allowed) {
     if (key in body) updates[key] = body[key]
@@ -35,15 +47,19 @@ export async function PATCH(
     .select()
     .single()
 
-  if (error) return NextResponse.json({ error: error.message }, { status: 500 })
+  if (error) {
+    console.error('[admin/models PATCH] update error:', error)
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
+  }
 
-  await sb.from('admin_logs').insert({
-    admin_id:    check.userId,
-    action:      'update_model',
-    target_id:   params.id,
-    target_type: 'model',
-    payload:     { model_id: params.id, updates },
-    details:     { model_id: params.id, updates },
+  invalidateModelCache()
+
+  await writeAuditLog({
+    adminId:    check.userId,
+    action:     'update_model',
+    targetId:   params.id,
+    targetType: 'model',
+    metadata:   { model_id: params.id, updates },
   })
 
   return NextResponse.json({ model: data })
@@ -57,20 +73,28 @@ export async function DELETE(
   if (!check.ok) return check.response
 
   const sb = getServiceSupabase()
+  // AD-9: model_used on agent_runs is a free-text string (not an FK), so
+  // deleting a model is DB-safe — it won't cascade-break existing rows.
+  // Historical run records will retain the model string for reference even
+  // after the model entry is removed from provider_models.
   const { error } = await sb
     .from('provider_models')
     .delete()
     .eq('id', params.id)
 
-  if (error) return NextResponse.json({ error: error.message }, { status: 500 })
+  if (error) {
+    console.error('[admin/models DELETE] delete error:', error)
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
+  }
 
-  await sb.from('admin_logs').insert({
-    admin_id:    check.userId,
-    action:      'delete_model',
-    target_id:   params.id,
-    target_type: 'model',
-    payload:     { model_id: params.id },
-    details:     { model_id: params.id },
+  invalidateModelCache()
+
+  await writeAuditLog({
+    adminId:    check.userId,
+    action:     'delete_model',
+    targetId:   params.id,
+    targetType: 'model',
+    metadata:   { model_id: params.id },
   })
 
   return NextResponse.json({ ok: true })

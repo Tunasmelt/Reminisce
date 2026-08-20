@@ -1,5 +1,6 @@
 import { decrypt } from '@/lib/encryption'
 import { getServiceSupabase } from '@/lib/supabase'
+import { getModel, invalidate as invalidateRegistry } from '@/lib/model-registry'
 
 // ─────────────────────────────────────────────────────
 //  Provider type
@@ -72,92 +73,75 @@ function getPlatformKey(provider: AIProvider): string {
 }
 
 // ─────────────────────────────────────────────────────
-//  Per-user rate limits (protects org-level API keys)
-//  rpd: 9999 = no daily cap enforced (provider has none)
+//  Per-user rate limits.
+//  Limits (rpm/rpd) come from the model-registry (single provider_models
+//  reader). Usage is counted from the dedicated `rate_events` table — NOT from
+//  wallet_transactions — so counting is independent of billing: refunds no
+//  longer double-count, there's no off-by-one from the request's own debit row,
+//  and BYOK calls (which write no transactions) are rate-limited too. (A3)
 // ─────────────────────────────────────────────────────
-
-const USER_RATE_LIMITS: Record<string, { rpm: number; rpd: number }> = {
-  // Groq — free tier
-  'llama-3.1-8b-instant':                          { rpm: 5, rpd: 300  },
-  'llama-3.3-70b-versatile':                       { rpm: 2, rpd: 20   },
-  'meta-llama/llama-4-scout-17b-16e-instruct':     { rpm: 3, rpd: 30   },
-  'moonshotai/kimi-k2-instruct-0905':              { rpm: 3, rpd: 30   },
-  'qwen/qwen3-32b':                                { rpm: 3, rpd: 30   },
-  'mixtral-8x7b-32768':                          { rpm: 2, rpd: 50   },
-  'qwen-2.5-coder-32b':                          { rpm: 3, rpd: 80   },
-  // Cerebras — free tier (1M tokens/day org, no per-req daily cap)
-  'llama3.1-8b':                                   { rpm: 5, rpd: 9999 },
-  'llama-3.3-70b':                                 { rpm: 3, rpd: 9999 },
-  'llama-4-scout-17b-16e-instruct':                { rpm: 3, rpd: 9999 },
-  'qwen-3-32b':                                    { rpm: 3, rpd: 9999 },
-  // SambaNova — free tier (no published daily cap)
-  'Meta-Llama-3.1-8B-Instruct':                   { rpm: 5, rpd: 9999 },
-  'Meta-Llama-3.1-70B-Instruct':                  { rpm: 3, rpd: 9999 },
-  'Meta-Llama-3.1-405B-Instruct':                 { rpm: 1, rpd: 9999 },
-  'Meta-Llama-3.3-70B-Instruct':                  { rpm: 3, rpd: 9999 },
-  'Qwen2.5-72B-Instruct':                         { rpm: 3, rpd: 9999 },
-  // Gemini — free tier
-  'gemini-2.5-flash-lite':                        { rpm: 3, rpd: 100  },
-  'gemini-2.5-flash':                             { rpm: 2, rpd: 25   },
-  'gemini-1.5-flash-lite':                        { rpm: 5, rpd: 200  },
-  // Mistral — Experiment plan (2 RPM org-wide)
-  'open-mistral-7b':                              { rpm: 1, rpd: 50   },
-  'mistral-small-latest':                         { rpm: 1, rpd: 50   },
-  'codestral-latest':                             { rpm: 1, rpd: 50   },
-  // Kimi — free tier
-  'kimi-k2.5':                                    { rpm: 3, rpd: 50   },
-  // Pro tier — billed, limits are generous
-  'claude-haiku-4-5':                             { rpm: 10, rpd: 500 },
-  'claude-sonnet-4-6-20250514':                   { rpm: 5,  rpd: 100 },
-  'gpt-4o-mini':                                  { rpm: 10, rpd: 500 },
-  'gpt-4o':                                       { rpm: 5,  rpd: 50  },
-  'gemini-2.5-pro':                               { rpm: 3,  rpd: 50  },
-  'mistral-large-latest':                         { rpm: 5,  rpd: 100 },
-  'deepseek/deepseek-chat:free':                  { rpm: 3,  rpd: 50  },
-  'nousresearch/hermes-3-llama-3.1-405b:free':    { rpm: 1,  rpd: 20  },
-  'liquid/lfm-40b:free':                          { rpm: 5,  rpd: 200 },
-}
 
 async function checkUserRateLimit(
   userId: string,
+  provider: string,
   model: string,
 ): Promise<{ allowed: boolean; reason?: string }> {
-  const limit = USER_RATE_LIMITS[model]
-  if (!limit) return { allowed: true }
+  const def = await getModel(provider, model)
+  if (!def) return { allowed: true } // unknown model — no limit info to enforce
 
   const supabase = getServiceSupabase()
-  const now = new Date()
-  const minuteAgo = new Date(now.getTime() - 60_000).toISOString()
-  const dayAgo    = new Date(now.getTime() - 86_400_000).toISOString()
+  const now = Date.now()
+  const minuteAgo = new Date(now - 60_000).toISOString()
+  const dayAgo    = new Date(now - 86_400_000).toISOString()
 
+  // Count BEFORE recording this call's event, so a request never counts itself.
   const [{ count: rpmCount }, { count: rpdCount }] = await Promise.all([
     supabase
-      .from('wallet_transactions')
+      .from('rate_events')
       .select('*', { count: 'exact', head: true })
       .eq('user_id', userId)
-      .eq('model_used', model)
+      .eq('model_id', model)
       .gte('created_at', minuteAgo),
     supabase
-      .from('wallet_transactions')
+      .from('rate_events')
       .select('*', { count: 'exact', head: true })
       .eq('user_id', userId)
-      .eq('model_used', model)
+      .eq('model_id', model)
       .gte('created_at', dayAgo),
   ])
 
-  if ((rpmCount ?? 0) >= limit.rpm) {
+  if ((rpmCount ?? 0) >= def.rate_limit_rpm) {
     return {
       allowed: false,
       reason: `Rate limit reached for ${model}. Please wait 60 seconds.`,
     }
   }
-  if (limit.rpd < 9999 && (rpdCount ?? 0) >= limit.rpd) {
+  if (def.rate_limit_rpd < 9999 && (rpdCount ?? 0) >= def.rate_limit_rpd) {
     return {
       allowed: false,
       reason: `daily_limit_exceeded: Daily limit reached for ${model}. Try a different model or come back tomorrow.`,
     }
   }
   return { allowed: true }
+}
+
+/** Record one rate-limit event for (user, model). Best-effort: a failed insert
+ *  must not block the AI call. Old rows should be pruned by a scheduled job
+ *  (the time-windowed COUNT stays fast via idx_rate_events_user_model_time). */
+async function recordRateEvent(userId: string, model: string): Promise<void> {
+  try {
+    const supabase = getServiceSupabase()
+    await supabase.from('rate_events').insert({ user_id: userId, model_id: model })
+  } catch (err) {
+    console.error('[ai-client] recordRateEvent failed (non-fatal):', err)
+  }
+}
+
+/** Invalidate the model cache after an admin updates provider_models.
+ *  Delegates to the registry — the single cache owner. Process-local (E-20):
+ *  other warm serverless instances converge within the registry TTL. */
+export function invalidateModelCache(): void {
+  invalidateRegistry()
 }
 
 // ─────────────────────────────────────────────────────
@@ -514,9 +498,10 @@ export async function callAI(params: {
     stream = false, temperature, max_tokens,
   } = params
 
-  // 1. Per-user rate limit check
-  const rlCheck = await checkUserRateLimit(userId, model)
+  // 1. Per-user rate limit check, then record this call's event.
+  const rlCheck = await checkUserRateLimit(userId, provider, model)
   if (!rlCheck.allowed) throw new Error(rlCheck.reason)
+  await recordRateEvent(userId, model)
 
   // 2. Resolve API key — user's own key takes priority
   const supabase = getServiceSupabase()
