@@ -33,9 +33,16 @@ export async function PATCH(
       return NextResponse.json({ error: 'Not found' }, { status: 404 })
 
     const updateFields: Record<string, unknown> = {}
-    if (typeof body.done     === 'boolean') updateFields.done     = body.done
-    if (typeof body.text     === 'string')  updateFields.text     = body.text
-    if ('due_date' in body)                 updateFields.due_date = body.due_date
+    // P-13: Map request body fields to the actual DB column names used by
+    // GET (message, remind_at, notified) — the original code used 'text',
+    // 'done', and 'due_date' which are different columns (or non-existent),
+    // making PATCH edits invisible to the read path.
+    if (typeof body.notified === 'boolean') updateFields.notified  = body.notified
+    if (typeof body.done     === 'boolean') updateFields.notified  = body.done      // alias for convenience
+    if (typeof body.text     === 'string')  updateFields.message   = body.text
+    if (typeof body.message  === 'string')  updateFields.message   = body.message   // also accept direct field name
+    if ('due_date' in body)                 updateFields.remind_at = body.due_date
+    if ('remind_at' in body)                updateFields.remind_at = body.remind_at  // also accept direct field name
 
     const { error } = await supabase
       .from('project_reminders')
@@ -46,8 +53,8 @@ export async function PATCH(
     if (error) throw error
     return NextResponse.json({ ok: true })
   } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err)
-    return NextResponse.json({ error: msg }, { status: 500 })
+    console.error('[pam/reminders/[id]] error:', err)
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }
 }
 
@@ -67,6 +74,19 @@ export async function DELETE(
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
 
     const supabase = getServiceSupabase()
+
+    // P-14: Verify existence before deleting — Supabase returns no error when
+    // 0 rows are affected, so without this check a missing or already-deleted
+    // reminder silently returns ok:true instead of a proper 404.
+    const { data: existing } = await supabase
+      .from('project_reminders')
+      .select('user_id')
+      .eq('id', params.id)
+      .single()
+
+    if (!existing || existing.user_id !== user.id)
+      return NextResponse.json({ error: 'Not found' }, { status: 404 })
+
     const { error } = await supabase
       .from('project_reminders')
       .delete()
@@ -76,7 +96,7 @@ export async function DELETE(
     if (error) throw error
     return NextResponse.json({ ok: true })
   } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err)
-    return NextResponse.json({ error: msg }, { status: 500 })
+    console.error('[pam/reminders/[id]] error:', err)
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }
 }

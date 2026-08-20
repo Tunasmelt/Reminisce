@@ -11,14 +11,16 @@ function hexToRgba(hex: string, a: number) {
   return `rgba(${r},${g},${b},${a})`
 }
 
-export function GenerationStepsPanel({
-  steps, currentStep, completedSteps, errorStep, accent,
+export function BlueprintGenerationPanel({
+  steps, genCurrentStep, completedSteps, genErrorStep, accent, onRetry,
 }: {
   steps: typeof GENERATION_STEPS
-  currentStep: number
+  genCurrentStep: number
   completedSteps: number[]
-  errorStep: number | null
+  genErrorStep: number | null
+  resumeStep?: number
   accent: string
+  onRetry?: (fromStep: number) => void
 }) {
   const waves = [
     { wave: 1, label: 'Wave 1 — Parallel', steps: steps.filter(s => s.wave === 1) },
@@ -35,7 +37,7 @@ export function GenerationStepsPanel({
       </div>
       {waves.map(({ wave, label, steps: ws }) => {
         const waveCompleted = ws.every(s => completedSteps.includes(s.index))
-        const waveActive    = ws.some(s => s.index === currentStep)
+        const waveActive    = ws.some(s => s.index === genCurrentStep)
         return (
           <div key={wave} style={{ marginBottom: 20 }}>
             <div style={{
@@ -57,8 +59,12 @@ export function GenerationStepsPanel({
             <div style={{ paddingLeft: 14, display: 'flex', flexDirection: 'column', gap: 6 }}>
               {ws.map(step => {
                 const done    = completedSteps.includes(step.index)
-                const running = step.index === currentStep
-                const failed  = errorStep === step.index
+                const running = step.index === genCurrentStep
+                const failed  = genErrorStep === step.index
+                
+                const isError = genErrorStep === step.index
+                const stepColor = isError ? '#f87171' : done ? '#34d399' : running ? accent : 'rgba(255,255,255,0.2)'
+
                 return (
                   <div key={step.index} style={{
                     display: 'flex', alignItems: 'center', gap: 8,
@@ -73,7 +79,7 @@ export function GenerationStepsPanel({
                   }}>
                     <div style={{
                       width: 6, height: 6, borderRadius: '50%', flexShrink: 0,
-                      background: failed ? '#ef4444' : done ? '#10b981' : running ? accent : 'rgba(255,255,255,0.15)',
+                      background: stepColor,
                       animation: running ? 'wPulse 1s infinite' : 'none',
                     }} />
                     <div style={{ flex: 1, minWidth: 0 }}>
@@ -90,7 +96,7 @@ export function GenerationStepsPanel({
                       )}
                     </div>
                     {done && <CheckCircle2 size={13} color="#10b981" />}
-                    {failed && <AlertTriangle size={13} color="#ef4444" />}
+                    {failed && <AlertTriangle size={13} color="#f87171" />}
                   </div>
                 )
               })}
@@ -98,6 +104,23 @@ export function GenerationStepsPanel({
           </div>
         )
       })}
+
+      {genErrorStep !== null && genErrorStep !== undefined && onRetry && (
+        <button
+          onClick={() => onRetry(genErrorStep)}
+          style={{
+            marginTop: 16, width: '100%',
+            padding: '10px 16px', borderRadius: 10,
+            background: 'rgba(248,113,113,0.08)',
+            border: '1px solid rgba(248,113,113,0.2)',
+            color: '#f87171', fontSize: 12, fontWeight: 700,
+            cursor: 'pointer', display: 'flex', alignItems: 'center',
+            justifyContent: 'center', gap: 8,
+          }}
+        >
+          ↺ Retry from step {genErrorStep + 1}
+        </button>
+      )}
     </div>
   )
 }

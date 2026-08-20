@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server'
-import { getServiceSupabase, supabase as clientSupabase, verifyProjectAccess } from '@/lib/supabase'
+import { getServiceSupabase, supabase as clientSupabase, verifyProjectAccess, isUserBanned, getProjectRole } from '@/lib/supabase'
 import { callAI } from '@/lib/ai-client'
 import { deductCost, refundCost } from '@/lib/wallet'
 import type { AIProvider } from '@/lib/ai-client'
@@ -16,6 +16,7 @@ import {
   type TechStackOption,
   type ConfirmedFeature,
 } from '@/lib/wizard-stages'
+import { ensureWallet } from '@/lib/wallet'
 
 export const dynamic = 'force-dynamic'
 export const maxDuration = 60
@@ -60,8 +61,27 @@ export async function POST(req: Request) {
       { status: 400 },
     )
 
+  if (message.length > 10000)
+    return NextResponse.json(
+      { error: 'Message too long. Please keep messages under 10,000 characters.' },
+      { status: 400 },
+    )
+
   if (!await verifyProjectAccess(user.id, projectId))
     return NextResponse.json({ error: 'Not found' }, { status: 404 })
+
+  // WZ-3: banned check (wizard/generate and wizard/session both check this)
+  if (await isUserBanned(user.id))
+    return NextResponse.json({ error: 'Account suspended' }, { status: 403 })
+
+  // WZ-1: head-only guard — wizard chat is a head-only action to prevent
+  // collaborators from burning coins on wizard AI turns
+  const chatRole = await getProjectRole(user.id, projectId)
+  if (chatRole !== 'head')
+    return NextResponse.json(
+      { error: 'Only the project head can use the Wizard' },
+      { status: 403 },
+    )
 
   const supabase = getServiceSupabase()
 
@@ -150,9 +170,14 @@ export async function POST(req: Request) {
         (m: any) => m.role !== 'system',
       )
 
+    // WZ-7: cap history sent to AI to the last 20 messages to avoid context
+    // window overflow on long wizard conversations. Full history is still
+    // persisted to wizard_sessions.messages — only the AI call window is capped.
+    const cappedHistory = existingMessages.slice(-20)
+
     const messagesForAI = [
       { role: 'system', content: systemPrompt },
-      ...existingMessages,
+      ...cappedHistory,
       { role: 'user', content: message },
     ]
 
@@ -167,6 +192,11 @@ export async function POST(req: Request) {
       .eq('id', session.id)
 
     // ── 7. Deduct coin cost ────────────────────────────────────────────────
+    // E-7: Guarantee wallet row exists before deduction — new users whose
+    // handle_new_user trigger failed would otherwise deduct against a phantom
+    // default that is never persisted to the DB.
+    await ensureWallet(user.id)
+
     const runId = `wizard-chat-${session.id}-${Date.now()}`
     try {
       const costResult = await deductCost(user.id, model, runId)
@@ -176,8 +206,11 @@ export async function POST(req: Request) {
           { status: 402 },
         )
       }
-    } catch {
-      // Non-fatal — continue if wallet check fails
+    } catch (deductErr) {
+      // WZ-2: log the exception — swallowing silently hides DB errors and
+      // could grant free AI calls on transient wallet failures
+      console.error('[wizard/chat] deductCost threw unexpectedly:', deductErr)
+      // Non-fatal — proceed; individual step charges are best-effort at this scale
     }
 
     // ── 8. Call AI ─────────────────────────────────────────────────────────
@@ -197,6 +230,7 @@ export async function POST(req: Request) {
       })
       aiResponse = result as Response
     } catch (aiErr: unknown) {
+      console.error('[wizard/chat] callAI threw:', aiErr)
       if (runId) await refundCost(user.id, model, runId)
       const wizError = classifyError(aiErr)
       await supabase
@@ -382,9 +416,8 @@ export async function POST(req: Request) {
           uiStacks:       uiStacks ?? null,
         })
 
-        controller.enqueue(
-          encoder.encode(`data: ${metaEvent}\n\ndata: [DONE]\n\n`),
-        )
+        controller.enqueue(encoder.encode(`data: ${metaEvent}\n\n`))
+        controller.enqueue(encoder.encode('data: [DONE]\n\n'))
       },
     })
 
@@ -398,9 +431,8 @@ export async function POST(req: Request) {
       },
     })
   } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err)
-    console.error('[wizard/chat] Error:', msg)
-    return NextResponse.json({ error: msg }, { status: 500 })
+    console.error('[wizard/chat] Top-level Error:', err)
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }
 }
 

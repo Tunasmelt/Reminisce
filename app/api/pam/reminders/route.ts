@@ -25,19 +25,23 @@ export async function GET(req: Request) {
       return NextResponse.json({ error: 'Not found' }, { status: 404 })
 
     const supabase = getServiceSupabase()
+    // P-29: Scope to the calling user's reminders — without this filter every
+    // team member can read every other member's personal reminders. The PATCH
+    // and DELETE routes already scope to user_id; GET must be consistent.
     const { data: reminders, error } = await supabase
       .from('project_reminders')
-      .select('id, text, due_date, done, created_at')
+      .select('id, message, remind_at, notified, created_at')
       .eq('project_id', projectId)
-      .eq('done', false)
-      .order('due_date', { ascending: true, nullsFirst: false })
+      .eq('user_id', user.id)
+      .eq('notified', false)
+      .order('remind_at', { ascending: true, nullsFirst: false })
       .limit(20)
 
     if (error) throw error
     return NextResponse.json({ reminders })
   } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err)
-    return NextResponse.json({ error: msg }, { status: 500 })
+    console.error('[pam/reminders] error:', err)
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }
 }
 
@@ -67,16 +71,16 @@ export async function POST(req: Request) {
       .insert({
         project_id: projectId,
         user_id:    user.id,
-        text:       text.trim(),
-        due_date:   due_date ?? null,
+        message:    text.trim(),
+        remind_at:  due_date ?? null,
       })
-      .select('id, text, due_date, done, created_at')
+      .select('id, message, remind_at, notified, created_at')
       .single()
 
     if (error) throw error
     return NextResponse.json({ reminder })
   } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err)
-    return NextResponse.json({ error: msg }, { status: 500 })
+    console.error('[pam/reminders] error:', err)
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }
 }

@@ -17,6 +17,11 @@ export async function GET(req: Request) {
     if (!user || authError)
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
 
+    // P-17: Ban check — POST already gates banned users; GET should too for
+    // consistency (banned users should not be able to access any PAM surface).
+    if (await isUserBanned(user.id))
+      return NextResponse.json({ error: 'Account suspended' }, { status: 403 })
+
     const { searchParams } = new URL(req.url)
     const projectId = searchParams.get('projectId')
     if (!projectId)
@@ -38,8 +43,8 @@ export async function GET(req: Request) {
     if (error) throw error
     return NextResponse.json({ threads })
   } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err)
-    return NextResponse.json({ error: msg }, { status: 500 })
+    console.error('[pam/threads] error:', err)
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }
 }
 
@@ -82,7 +87,7 @@ export async function POST(req: Request) {
     if (error) throw error
     return NextResponse.json({ thread })
   } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err)
-    return NextResponse.json({ error: msg }, { status: 500 })
+    console.error('[pam/threads] error:', err)
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }
 }

@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server'
-import { getServiceSupabase, supabase as clientSupabase } from '@/lib/supabase'
+import { getServiceSupabase, supabase as clientSupabase, isUserBanned } from '@/lib/supabase'
 
 export const dynamic = 'force-dynamic'
 
@@ -49,6 +49,9 @@ export async function GET(
     if (!user || authError)
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
 
+    if (await isUserBanned(user.id))
+      return NextResponse.json({ error: 'Account suspended' }, { status: 403 })
+
     const supabase = getServiceSupabase()
 
     // ── Ownership check ────────────────────────────────────────────────────
@@ -64,8 +67,8 @@ export async function GET(
     if (error) throw error
     return NextResponse.json({ messages })
   } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err)
-    return NextResponse.json({ error: msg }, { status: 500 })
+    console.error('[pam/thread] error:', err)
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }
 }
 
@@ -86,15 +89,31 @@ export async function PATCH(
     if (!user || authError)
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
 
+    if (await isUserBanned(user.id))
+      return NextResponse.json({ error: 'Account suspended' }, { status: 403 })
+
     const supabase = getServiceSupabase()
 
     // ── Ownership check ────────────────────────────────────────────────────
     const check = await verifyThreadOwnership(params.id, user.id, supabase)
     if (!check.ok) return check.response
 
-    const body = await req.json()
+    let body: { title?: string; archived?: boolean }
+    try {
+      body = await req.json()
+    } catch {
+      return NextResponse.json({ error: 'Invalid JSON body' }, { status: 400 })
+    }
     const updateFields: Record<string, unknown> = {}
-    if (typeof body.title    === 'string')  updateFields.title    = body.title
+    if (typeof body.title === 'string') {
+      // P-20: Reject empty strings — the DB trigger auto-titles at 60 chars
+      // but manual renames have no guard, so "" would blank the title.
+      if (body.title.trim().length === 0)
+        return NextResponse.json({ error: 'Title cannot be empty' }, { status: 400 })
+      // P-12: Cap manual titles at 100 chars to match auto-title intent and
+      // prevent DB column overflow / UI layout breakage from unbounded input.
+      updateFields.title = body.title.trim().slice(0, 100)
+    }
     if (typeof body.archived === 'boolean') updateFields.archived = body.archived
 
     if (Object.keys(updateFields).length === 0)
@@ -108,7 +127,7 @@ export async function PATCH(
     if (error) throw error
     return NextResponse.json({ ok: true })
   } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err)
-    return NextResponse.json({ error: msg }, { status: 500 })
+    console.error('[pam/thread] error:', err)
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }
 }

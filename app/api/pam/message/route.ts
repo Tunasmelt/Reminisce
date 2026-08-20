@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server'
-import { getServiceSupabase, supabase as clientSupabase, verifyProjectAccess } from '@/lib/supabase'
+import { getServiceSupabase, supabase as clientSupabase, verifyProjectAccess, getProjectRole } from '@/lib/supabase'
 import { callAI, userHasOwnKey } from '@/lib/ai-client'
 import type { AIProvider } from '@/lib/ai-client'
 import { deductCost, refundCost, ensureWallet } from '@/lib/wallet'
@@ -58,6 +58,7 @@ function buildSystemPrompt(ctx: {
   workflowFeatures:  string | null   // reminisce/workflow/features.md content
   currentDate:       string
   pastMemory:        Array<{ summary: string; created_at: string }>
+  semanticMemory?:   string[]
 }): string {
   // ── Phase + feature summary ──────────────────────────────────────────────
   const phasesSummary = ctx.phases.length > 0
@@ -109,6 +110,11 @@ function buildSystemPrompt(ctx: {
   // ── Git state ────────────────────────────────────────────────────────────
   const gitBlock = (ctx.gitBranch || ctx.gitLastCommit)
     ? `Current branch: ${ctx.gitBranch ?? 'unknown'}\nLast commit: ${ctx.gitLastCommit ?? 'unknown'}`
+    : ''
+
+  // Tier 0: semantic memory (most relevant fragments)
+  const semanticBlock = ctx.semanticMemory && ctx.semanticMemory.length > 0
+    ? `## Semantic Memory (most relevant to this message)\n${ctx.semanticMemory.join('\n\n---\n\n')}\n\n`
     : ''
 
   // ── Past memory ──────────────────────────────────────────────────────────
@@ -192,6 +198,7 @@ ${featuresSummary}
 ${workflowBlock ? `\nWORKFLOW:\n${workflowBlock}` : ''}
 ${summaryBlock ? `\n${summaryBlock}` : ''}
 ${fullBlock ? `\n${fullBlock}` : ''}
+${semanticBlock ? `\n${semanticBlock}` : ''}
 ${memoryBlock ? `\n${memoryBlock}` : ''}
 ═══════════════════════════════════════
 
@@ -203,16 +210,21 @@ not covered by the context, say so clearly rather than guessing.`
 //  Action signal parser
 // ─────────────────────────────────────────────────────────────────────────────
 
+// P-8: Use global replace so ALL [PAM_ACTION] blocks are stripped from the
+// displayed text — PAM may emit multiple blocks for compound commands but we
+// only execute the first one to avoid ambiguity.
 function extractAction(text: string): {
   cleanText: string
   actionType: string | null
   actionPayload: Record<string, unknown> | null
 } {
   const match = text.match(/\[PAM_ACTION\]([\s\S]*?)\[\/PAM_ACTION\]/m)
-  if (!match) return { cleanText: text.trim(), actionType: null, actionPayload: null }
+  // Always strip every action block from display text (global flag 'g')
+  const cleanText = text.replace(/\[PAM_ACTION\][\s\S]*?\[\/PAM_ACTION\]/gm, '').trim()
+
+  if (!match) return { cleanText, actionType: null, actionPayload: null }
 
   const jsonStr = match[1].trim()
-  const cleanText = text.replace(/\[PAM_ACTION\][\s\S]*?\[\/PAM_ACTION\]/m, '').trim()
 
   try {
     const payload = JSON.parse(jsonStr) as Record<string, unknown>
@@ -286,15 +298,51 @@ export async function POST(req: Request) {
     if (await isUserBanned(user.id))
       return NextResponse.json({ error: 'Account suspended' }, { status: 403 })
 
-    const { threadId, projectId, provider, model, content } = await req.json()
+    // PM-1: Guard JSON parse so a malformed body returns 400 not 500.
+    let pamBody: { threadId?: string; projectId?: string; provider?: string; model?: string; content?: string }
+    try {
+      pamBody = await req.json()
+    } catch {
+      return NextResponse.json({ error: 'Invalid JSON body' }, { status: 400 })
+    }
+    const { threadId, projectId, provider, model, content } = pamBody
 
     if (!threadId || !projectId || !provider || !model || !content?.trim())
       return NextResponse.json({ error: 'Missing parameters' }, { status: 400 })
 
+    // PM-2: Cap message length to prevent excessively large system prompts and
+    // runaway token usage. 12,000 chars ≈ ~3,000 tokens — generous for any
+    // single chat turn while still bounding server-side token costs.
+    const MAX_MESSAGE_LENGTH = 12_000
+    if (content.length > MAX_MESSAGE_LENGTH) {
+      return NextResponse.json(
+        { error: `Message exceeds maximum length of ${MAX_MESSAGE_LENGTH} characters` },
+        { status: 400 },
+      )
+    }
+
     if (!await verifyProjectAccess(user.id, projectId))
       return NextResponse.json({ error: 'Not found' }, { status: 404 })
 
-    await ensureWallet(user.id)
+    const role = await getProjectRole(user.id, projectId)
+    if (role === 'viewer') {
+      return NextResponse.json(
+        { error: 'Viewers cannot send PAM messages' },
+        { status: 403 }
+      )
+    }
+
+    // P-5: Isolate ensureWallet so a setup failure returns a clear 500
+    // immediately, before any deduction or DB work begins.
+    try {
+      await ensureWallet(user.id)
+    } catch (walletSetupErr) {
+      console.error('[pam/message] ensureWallet failed:', walletSetupErr)
+      return NextResponse.json(
+        { error: 'Failed to initialise wallet. Please try again.' },
+        { status: 500 },
+      )
+    }
 
     const supabase = getServiceSupabase()
 
@@ -322,12 +370,18 @@ export async function POST(req: Request) {
 
     // ── BYOK check ───────────────────────────────────────────────────────
     const isBYOK = await userHasOwnKey(user.id, provider as AIProvider)
-    let runId: string | null = null
 
     if (!isBYOK) {
-      const costResult = await deductCost(user.id, model)
-      if (!costResult.success)
-        return NextResponse.json({ error: costResult.message }, { status: 402 })
+      // P-6: Wrap deductCost so a DB failure mid-deduction returns a clear
+      // error rather than falling through to callAI with an uncommitted charge.
+      try {
+        const costResult = await deductCost(user.id, model)
+        if (!costResult.success)
+          return NextResponse.json({ error: costResult.message }, { status: 402 })
+      } catch (err) {
+        console.error('[pam/message] deductCost failed:', err)
+        return NextResponse.json({ error: 'Failed to process payment' }, { status: 500 })
+      }
     }
 
     // ── Detect which files to smart-load for this turn ──────────────────────
@@ -379,8 +433,25 @@ export async function POST(req: Request) {
         .limit(4),
     ])
 
+    // ── Semantic search ─────────────────────────────────────────────────────
+    let semanticMemory: string[] = []
+    try {
+      const { searchMemory } = await import('@/lib/vector-memory')
+      const chunks = await searchMemory(projectId, content.trim(), 3)
+      if (chunks.length > 0) {
+        semanticMemory = chunks
+          .filter(c => c.similarity > 0.75) // only high-confidence
+          .map(c => `[Memory — ${c.sourceType}${c.sourcePath ? ` / ${c.sourcePath}` : ''}]\n${c.content}`)
+      }
+    } catch (semanticErr) {
+      // P-18: Log rather than silently swallow — a missing OPENAI_API_KEY or
+      // pgvector misconfiguration causes PAM to silently degrade without any
+      // server-side signal. This surfaces it without blocking the request.
+      console.warn('[pam/message] semantic search failed (non-fatal):', semanticErr)
+    }
+
     // ── Save user message ───────────────────────────────────────────────────
-    const { data: userMsg } = await supabase
+    await supabase
       .from('pam_messages')
       .insert({
         thread_id:  threadId,
@@ -390,8 +461,6 @@ export async function POST(req: Request) {
       })
       .select('id')
       .single()
-
-    runId = userMsg?.id ?? null
 
     // ── Build tiered context ────────────────────────────────────────────────
     const allRows = allContextRows ?? []
@@ -459,6 +528,7 @@ export async function POST(req: Request) {
         summary:    s.summary,
         created_at: s.created_at,
       })),
+      semanticMemory,
     })
 
     // ── Build message array ─────────────────────────────────────────────────
@@ -484,7 +554,10 @@ export async function POST(req: Request) {
         messages,
       }) as Response
     } catch (aiErr) {
-      if (!isBYOK) await refundCost(user.id, model, runId ?? undefined)
+      // P-22: PAM messages are not tracked in agent_runs, so runId is always
+      // null here. refundCost works without a run_id — the refund transaction
+      // simply has no run link in the audit trail, which is acceptable for PAM.
+      if (!isBYOK) await refundCost(user.id, model)
       throw aiErr
     }
 
@@ -497,20 +570,33 @@ export async function POST(req: Request) {
         if (!reader) { controller.close(); return }
 
         try {
+          // P-21: Carry-over buffer for fragmented SSE delivery — same pattern
+          // as agent/run (AR-2). A TCP chunk may contain a partial SSE line;
+          // splitting each chunk naively on '\n' drops the incomplete tail.
+          // We accumulate into sseBuffer and only process '\n\n'-terminated
+          // complete SSE messages.
+          let sseBuffer = ''
+
           while (true) {
             const { done, value } = await reader.read()
             if (done) break
             const chunk = decoder.decode(value, { stream: true })
             controller.enqueue(value)
 
-            for (const line of chunk.split('\n')) {
-              if (!line.startsWith('data: ')) continue
-              const data = line.slice(6)
-              if (data === '[DONE]') continue
-              try {
-                const parsed = JSON.parse(data)
-                fullText += parsed.choices?.[0]?.delta?.content ?? ''
-              } catch { /* partial chunk */ }
+            sseBuffer += chunk
+            const messages = sseBuffer.split('\n\n')
+            sseBuffer = messages.pop() ?? ''
+
+            for (const message of messages) {
+              for (const line of message.split('\n')) {
+                if (!line.startsWith('data: ')) continue
+                const data = line.slice(6)
+                if (data === '[DONE]') continue
+                try {
+                  const parsed = JSON.parse(data)
+                  fullText += parsed.choices?.[0]?.delta?.content ?? ''
+                } catch { /* partial chunk */ }
+              }
             }
           }
 
@@ -538,7 +624,10 @@ export async function POST(req: Request) {
           }).eq('id', threadId)
 
           // ── Send meta event to client ───────────────────────────────────
-          const hasDrift = fullText.includes('⚠️ Scope alert:')
+          // P-24: Use regex instead of literal string — same fix as AR-13 in
+          // agent/run. Models may emit ⚠ (U+26A0, no variation selector) rather
+          // than ⚠️ (U+26A0 + U+FE0F), causing the literal includes() to miss it.
+          const hasDrift = /⚠️?\s*scope\s+alert:/i.test(fullText)
           controller.enqueue(
             new TextEncoder().encode(
               `data: ${JSON.stringify({
@@ -559,7 +648,7 @@ export async function POST(req: Request) {
           controller.enqueue(new TextEncoder().encode('data: [DONE]\n\n'))
         } catch (err) {
           console.error('PAM stream error:', err)
-          if (!isBYOK) await refundCost(user.id, model, runId ?? undefined)
+          if (!isBYOK) await refundCost(user.id, model) // P-22: no run_id for PAM — see note above
         } finally {
           controller.close()
         }
@@ -574,11 +663,18 @@ export async function POST(req: Request) {
       },
     })
   } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err)
-    console.error('PAM message error:', msg)
-    return NextResponse.json({ error: msg }, { status: 500 })
+    console.error('[pam/message POST] error:', err)
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }
 }
+
+// P-2: Allowed values for feature and phase status fields.
+// Any PAM action payload that carries a different value is rejected before
+// the DB write so prompt-injection or malformed AI output can't write
+// arbitrary strings into features.status / phases.status.
+const VALID_STATUSES = new Set([
+  'planned', 'todo', 'in_progress', 'review', 'blocked', 'done',
+])
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  PATCH /api/pam/message
@@ -606,19 +702,50 @@ export async function PATCH(req: Request) {
 
     const { data: msg } = await supabase
       .from('pam_messages')
-      .select('action_type, action_payload, project_id')
+      // P-1: also select action_confirmed (idempotency check)
+      // P-4: also select thread_id (ownership check)
+      .select('action_type, action_payload, action_confirmed, project_id, thread_id')
       .eq('id', messageId)
       .single()
 
     if (!msg || !await verifyProjectAccess(user.id, msg.project_id))
       return NextResponse.json({ error: 'Not found' }, { status: 404 })
 
-    await supabase.from('pam_messages')
-      .update({ action_confirmed: confirmed })
-      .eq('id', messageId)
+    // P-4: Verify the calling user owns the thread — project collaborators
+    // should not be able to confirm/reject another user's PAM actions.
+    const { data: threadOwner } = await supabase
+      .from('pam_threads')
+      .select('user_id')
+      .eq('id', msg.thread_id as string)
+      .single()
+    if (!threadOwner || threadOwner.user_id !== user.id)
+      return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
 
-    if (!confirmed)
+    // P-11: Viewers cannot execute PAM actions that mutate project data.
+    const userRole = await getProjectRole(user.id, msg.project_id as string)
+    if (userRole === 'viewer')
+      return NextResponse.json(
+        { error: 'Viewers cannot confirm PAM actions' },
+        { status: 403 },
+      )
+
+    // P-1: Idempotency guard — if already confirmed or rejected, return early
+    // without re-executing. Prevents duplicate inserts from concurrent PATCHes.
+    if (msg.action_confirmed !== null && msg.action_confirmed !== undefined)
+      return NextResponse.json({ ok: true, executed: msg.action_confirmed as boolean, skipped: true })
+
+    // Rejection path: persist immediately and return — no action to execute.
+    if (!confirmed) {
+      await supabase.from('pam_messages')
+        .update({ action_confirmed: false })
+        .eq('id', messageId)
       return NextResponse.json({ ok: true, executed: false })
+    }
+
+    // P-30: Do NOT persist action_confirmed = true until AFTER the action
+    // executes successfully. The previous order wrote confirmed=true first,
+    // then ran the switch — if the switch threw, the message was permanently
+    // marked confirmed with no actual DB change, with no way to retry.
 
     const payload    = msg.action_payload as Record<string, unknown>
     const projectId  = msg.project_id as string
@@ -638,15 +765,33 @@ export async function PATCH(req: Request) {
     switch (msg.action_type) {
       case 'UPDATE_FEATURE_STATUS': {
         const { featureId, newStatus, featureName } = payload
-        await supabase.from('features')
-          .update({ status: newStatus as string })
-          .eq('id', featureId as string)
-          .eq('project_id', projectId)
-        changelogEntry = `\n## ${dateStr} — Feature Status Update${branch ? ` (${branch})` : ''}\n**Action:** UPDATE_FEATURE_STATUS\n**Feature:** ${featureName} → \`${newStatus}\`\n---\n`
+        // P-2: Reject unrecognised status strings before writing to DB.
+        if (!VALID_STATUSES.has(newStatus as string))
+          return NextResponse.json(
+            { error: `Invalid status value: "${newStatus}". Must be one of: ${Array.from(VALID_STATUSES).join(', ')}` },
+            { status: 400 },
+          )
+        // P-25: Only write the changelog (and the ID-based update) when featureId
+        // is present. When absent, the name-based fallback below is the actual
+        // write path — emitting the changelog unconditionally would record a
+        // successful update even when the ID-based write matched zero rows.
+        if (featureId) {
+          await supabase.from('features')
+            .update({ status: newStatus as string })
+            .eq('id', featureId as string)
+            .eq('project_id', projectId)
+          changelogEntry = `\n## ${dateStr} — Feature Status Update${branch ? ` (${branch})` : ''}\n**Action:** UPDATE_FEATURE_STATUS\n**Feature:** ${featureName} → \`${newStatus}\`\n---\n`
+        }
         break
       }
       case 'UPDATE_PHASE_STATUS': {
         const { phaseId, newStatus, phaseName } = payload
+        // P-2: Same enum guard for phase status.
+        if (!VALID_STATUSES.has(newStatus as string))
+          return NextResponse.json(
+            { error: `Invalid status value: "${newStatus}". Must be one of: ${Array.from(VALID_STATUSES).join(', ')}` },
+            { status: 400 },
+          )
         await supabase.from('phases')
           .update({ status: newStatus as string })
           .eq('id', phaseId as string)
@@ -656,11 +801,14 @@ export async function PATCH(req: Request) {
       }
       case 'CREATE_PROMPT': {
         const { featureId, promptText, featureName } = payload
+        // P-27: Cap prompt text at 20 KB — a runaway model response could
+        // insert an extremely large row that degrades prompt list performance.
+        const safePromptText = (promptText as string).slice(0, 20_000)
         await supabase.from('prompts').insert({
           project_id:        projectId,
           feature_id:        featureId ?? null,
-          raw_prompt:        promptText as string,
-          structured_prompt: promptText as string,
+          raw_prompt:        safePromptText,
+          structured_prompt: safePromptText,
           prompt_type:       'PAM_GENERATED',
           title:             `PAM: ${featureName ?? 'Generated prompt'}`,
         })
@@ -675,40 +823,52 @@ export async function PATCH(req: Request) {
           .eq('id', phaseId as string)
           .eq('project_id', projectId)
           .single()
-        if (phase) {
-          await supabase.from('features').insert({
-            project_id:  projectId,
-            phase_id:    phaseId as string,
-            name:        featureName as string,
-            type:        (featureType as string) ?? 'frontend',
-            description: (description as string) ?? null,
-            status:      'planned',
-            priority:    0,
-          })
-        }
+        // P-7: Return a real error when the phase doesn't exist or doesn't
+        // belong to this project — previously this silently returned ok:true
+        // while skipping the insert entirely.
+        if (!phase)
+          return NextResponse.json(
+            { error: 'Phase not found or does not belong to this project' },
+            { status: 404 },
+          )
+        await supabase.from('features').insert({
+          project_id:  projectId,
+          phase_id:    phaseId as string,
+          name:        featureName as string,
+          type:        (featureType as string) ?? 'frontend',
+          description: (description as string) ?? null,
+          status:      'planned',
+          priority:    0,
+        })
         changelogEntry = `\n## ${dateStr} — Feature Added${branch ? ` (${branch})` : ''}\n**Action:** ADD_FEATURE\n**Feature:** ${featureName} (${featureType}) added to phase ${(payload.phaseName as string) ?? ''}\n---\n`
         break
       }
       case 'CREATE_REMINDER': {
         const { text, due_date } = payload
+        // P-13: Use 'message' and 'remind_at' — the actual DB column names
+        // (matching GET /pam/reminders). The previous code used 'text' and
+        // 'due_date' which silently inserted into the wrong columns.
         await supabase.from('project_reminders').insert({
           project_id: projectId,
           user_id:    user.id,
-          text:       (text as string).trim(),
-          due_date:   (due_date as string) ?? null,
+          message:    (text as string).trim(),
+          remind_at:  (due_date as string) ?? null,
         })
         // Reminders don't go in changelog — they're ephemeral
         break
       }
     }
 
-    // Append to changes.md — non-fatal
-    if (changelogEntry) {
-      await appendToChangelog(supabase, projectId, changelogEntry)
-    }
-
-    // ── Sync feature status to DB as fallback (in case featureId was missing/wrong) ──
-    if (confirmed && msg.action_type === 'UPDATE_FEATURE_STATUS' && payload?.featureName) {
+    // ── Name-based fallback for UPDATE_FEATURE_STATUS ─────────────────────────
+    // P-16: Only run when featureId was absent from the AI payload — i.e. the
+    // ID-based update above had nothing to target. Previously this ran
+    // unconditionally, producing a second write on every confirm and risking
+    // updating the wrong feature when two features share a similar name.
+    if (
+      msg.action_type === 'UPDATE_FEATURE_STATUS' &&
+      payload?.featureName &&
+      !payload?.featureId   // ← fallback only when ID was missing
+    ) {
       const { newStatus, featureName } = payload
       const { data: matchedFeature } = await supabase
         .from('features')
@@ -723,12 +883,27 @@ export async function PATCH(req: Request) {
           .from('features')
           .update({ status: newStatus as string })
           .eq('id', matchedFeature.id)
+        // P-25: Write changelog for the name-based path too, now that we know
+        // the update actually targeted a real row.
+        changelogEntry = `\n## ${dateStr} — Feature Status Update${branch ? ` (${branch})` : ''}\n**Action:** UPDATE_FEATURE_STATUS\n**Feature:** ${featureName} → \`${newStatus}\`\n---\n`
       }
     }
 
+    // Append to changes.md — non-fatal
+    if (changelogEntry) {
+      await appendToChangelog(supabase, projectId, changelogEntry)
+    }
+
+    // P-30: Mark action confirmed only after all mutations succeeded.
+    // If the switch or fallback threw, we never reach this line — the message
+    // stays with action_confirmed=null so the user can retry.
+    await supabase.from('pam_messages')
+      .update({ action_confirmed: true })
+      .eq('id', messageId)
+
     return NextResponse.json({ ok: true, executed: true })
   } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err)
-    return NextResponse.json({ error: msg }, { status: 500 })
+    console.error('[pam/message PATCH] error:', err)
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }
 }

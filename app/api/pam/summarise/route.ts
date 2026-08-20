@@ -1,7 +1,8 @@
 import { NextResponse } from 'next/server'
 import { getServiceSupabase, supabase as clientSupabase, verifyProjectAccess } from '@/lib/supabase'
-import { callAI } from '@/lib/ai-client'
+import { callAI, userHasOwnKey } from '@/lib/ai-client'
 import type { AIProvider } from '@/lib/ai-client'
+import { deductCost, ensureWallet } from '@/lib/wallet'
 
 export const dynamic = 'force-dynamic'
 
@@ -40,14 +41,60 @@ export async function POST(req: Request) {
     // Load thread + project info
     const { data: thread } = await supabase
       .from('pam_threads')
-      .select('project_id, title, message_count')
+      // user_id for P-10 ownership check; summarised for P-15 idempotency guard
+      .select('project_id, user_id, title, message_count, summarised')
       .eq('id', threadId)
       .single()
 
     if (!thread) return NextResponse.json({ error: 'Thread not found' }, { status: 404 })
 
+    // P-28 + P-15: Atomically claim the thread before doing any work.
+    // The read→check→write pattern is a TOCTOU race: two concurrent calls
+    // could both see summarised=false and both proceed to insert duplicate
+    // pam_thread_summaries rows, crowding out other threads' cross-thread memory.
+    // Fix: attempt to flip summarised=true with a WHERE summarised=false guard.
+    // If the UPDATE affects 0 rows, another call already claimed it — skip.
+    const { data: claimData } = await supabase
+      .from('pam_threads')
+      .update({ summarised: true })
+      .eq('id', threadId)
+      .eq('summarised', false)   // ← atomic claim: only one caller wins
+      .select('id')
+
+    if (!claimData || claimData.length === 0)
+      return NextResponse.json({ ok: true, skipped: true })
+
+    // Already-summarised shortcut (skip the project access check too)
+    if (thread.summarised)
+      return NextResponse.json({ ok: true, skipped: true })
+
     if (!await verifyProjectAccess(user.id, thread.project_id))
       return NextResponse.json({ error: 'Not found' }, { status: 404 })
+
+    // P-10: Thread ownership check — project collaborators should not be
+    // able to trigger summarisation (and indirect transcript exposure) of
+    // another user's private PAM thread.
+    if (thread.user_id !== user.id)
+      return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
+
+    // P-9: Deduct cost for the summarise AI call. This is a background
+    // operation so we skip (return early) rather than blocking on failure —
+    // that way a coin shortage degrades gracefully (no summary stored) rather
+    // than crashing the caller. BYOK users bypass the economy as normal.
+    const isBYOK = await userHasOwnKey(user.id, provider as AIProvider)
+    if (!isBYOK) {
+      try {
+        await ensureWallet(user.id)
+        const costResult = await deductCost(user.id, model)
+        if (!costResult.success) {
+          console.warn('[pam/summarise] insufficient balance — skipping summarise for user', user.id)
+          return NextResponse.json({ ok: true, skipped: true })
+        }
+      } catch (walletErr) {
+        console.error('[pam/summarise] wallet error — skipping summarise:', walletErr)
+        return NextResponse.json({ ok: true, skipped: true })
+      }
+    }
 
     // Build compact transcript for summarisation
     const transcript = messages
@@ -82,8 +129,12 @@ Do NOT add padding or generic statements.`
       ],
     }) as { choices: Array<{ message: { content: string } }> }
 
-    const summary = aiRes.choices?.[0]?.message?.content?.trim() ?? ''
-    if (!summary) return NextResponse.json({ ok: true, skipped: true })
+    const rawSummary = aiRes.choices?.[0]?.message?.content?.trim() ?? ''
+    if (!rawSummary) return NextResponse.json({ ok: true, skipped: true })
+
+    // P-19: Cap at 1000 chars — a runaway model response should not bloat the
+    // cross-thread memory injected into every future PAM turn for this project.
+    const summary = rawSummary.slice(0, 1000)
 
     // Store summary
     await supabase.from('pam_thread_summaries').insert({
@@ -93,14 +144,12 @@ Do NOT add padding or generic statements.`
       message_count: thread.message_count ?? messages.length,
     })
 
-    // Mark thread as summarised
-    await supabase.from('pam_threads')
-      .update({ summarised: true })
-      .eq('id', threadId)
+    // P-28: summarised=true was already flipped atomically at the top of this
+    // function (the atomic claim). No need to update it again here.
 
     return NextResponse.json({ ok: true, summary })
   } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err)
-    return NextResponse.json({ error: msg }, { status: 500 })
+    console.error('[pam/summarise] error:', err)
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }
 }

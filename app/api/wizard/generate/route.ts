@@ -1,7 +1,7 @@
 import { NextResponse } from 'next/server'
-import { getServiceSupabase, supabase as clientSupabase, verifyProjectAccess } from '@/lib/supabase'
+import { getServiceSupabase, supabase as clientSupabase, verifyProjectAccess, getProjectRole } from '@/lib/supabase'
 import { callAI } from '@/lib/ai-client'
-import { awardCoins, deductCost, refundCost, MODEL_COSTS } from '@/lib/wallet'
+import { awardCoins, deductCost, refundCost, getModelCostInfo } from '@/lib/wallet'
 import type { AIProvider } from '@/lib/ai-client'
 import {
   buildGenerationPrompts,
@@ -92,7 +92,7 @@ export async function POST(req: Request) {
     projectId,
     provider   = 'groq',
     model      = 'llama-3.3-70b-versatile',
-    resumeStep = 0,
+    resumeStep: rawResumeStep = 0,
   } = body
 
   if (!sessionId || !projectId)
@@ -101,8 +101,23 @@ export async function POST(req: Request) {
       { status: 400 },
     )
 
+  // WZ-6: clamp resumeStep to valid range [0, GENERATION_STEPS.length - 1]
+  // An out-of-range value would skip the generation lock without doing useful work
+  const resumeStep = Math.max(0, Math.min(
+    typeof rawResumeStep === 'number' ? Math.floor(rawResumeStep) : 0,
+    GENERATION_STEPS.length - 1,
+  ))
+
   if (!await verifyProjectAccess(user.id, projectId))
     return NextResponse.json({ error: 'Not found' }, { status: 404 })
+
+  const role = await getProjectRole(user.id, projectId)
+  if (role !== 'head') {
+    return NextResponse.json(
+      { error: 'Only the project head can run the Wizard' },
+      { status: 403 }
+    )
+  }
 
   const supabase = getServiceSupabase()
 
@@ -129,6 +144,41 @@ export async function POST(req: Request) {
   const isRegeneration =
     session.stage === 'complete' ||
     session.generation_status === 'complete'
+
+  // ── Server-side generation lock ──────────────────────────────────────────
+  // E-6: Prevent two concurrent POST /wizard/generate requests for the same
+  // session from both starting generation and double-charging coins.
+  //
+  // Strategy: combine the lock check AND the initial status update into one
+  // atomic UPDATE with a .neq filter. The UPDATE only succeeds (returns > 0
+  // rows) if generation_status is NOT already 'generating' at write time.
+  // Only the first concurrent request wins; the second sees 0 rows and is
+  // rejected — no separate read/check needed.
+  //
+  // For resume (resumeStep > 0) we skip the lock so retries can proceed.
+  if (resumeStep === 0) {
+    const { data: lockClaimed } = await supabase
+      .from('wizard_sessions')
+      .update({
+        generation_status: 'generating',
+        generation_step:   0,
+        last_error:        null,
+      })
+      .eq('id', sessionId)
+      .neq('generation_status', 'generating')  // atomic: only claim if not already taken
+      .select('id')
+
+    if (!lockClaimed || lockClaimed.length === 0) {
+      return NextResponse.json(
+        {
+          error:   'generation_in_progress',
+          message: 'Generation is already running for this session. Wait for it to complete or refresh.',
+        },
+        { status: 409 },
+      )
+    }
+    // Lock claimed — status already set to 'generating' by the UPDATE above
+  }
 
   // ── Load project name + git integration fields ────────────────────────────
   const { data: project } = await supabase
@@ -180,10 +230,12 @@ export async function POST(req: Request) {
   // Blueprint generation makes 5 AI calls. Estimate minimum cost:
   // Steps 0+1 use user's selected model, steps 2-4 use 8B light model.
   // Check user has at least enough for steps 0+1 before starting.
-  const stepModelCost = MODEL_COSTS[model] ?? { currency: 'coins', amount: 1, tier: 'free' }
+  const stepModelCost = await getModelCostInfo(model)
   if (stepModelCost.currency === 'coins') {
-    const { getWallet, applyDailyReset } = await import('@/lib/wallet')
+    const { getWallet, applyDailyReset, ensureWallet } = await import('@/lib/wallet')
     try {
+      // E-8: Guarantee the wallet row exists before any balance read
+      await ensureWallet(user.id)
       await applyDailyReset(user.id)
       const wallet = await getWallet(user.id)
       const minRequired = stepModelCost.amount * 2 // at minimum steps 0 + 1
@@ -196,7 +248,11 @@ export async function POST(req: Request) {
           { status: 402 },
         )
       }
-    } catch { /* non-fatal — continue if wallet check fails */ }
+    } catch (preflightErr) {
+      // E-5: Log preflight errors — silent swallow hides wallet row failures
+      console.warn('[wizard/generate] preflight wallet check failed:', preflightErr)
+      // Non-fatal — generation proceeds; individual deductCost calls will catch shortfalls
+    }
   }
 
   // Conversation summary — last 6 non-system messages for extra context
@@ -224,11 +280,20 @@ export async function POST(req: Request) {
 
   const generationPrompts = buildGenerationPrompts(generationCtx)
 
-  // ── Mark session as generating ────────────────────────────────────────────
-  await supabase
-    .from('wizard_sessions')
-    .update({ generation_status: 'generating', generation_step: resumeStep, last_error: null })
-    .eq('id', sessionId)
+  // ── Warn if no confirmed features ─────────────────────────────────────────
+  // Non-fatal — generation continues but blueprint quality will be lower.
+  const featureWarning = confirmedFeatures.length === 0
+    ? 'No confirmed features found. Blueprint quality may be lower. Consider adding features in the wizard.'
+    : null
+
+  // ── Mark session as generating (resume path only) ────────────────────────
+  // For resumeStep === 0 this was already handled atomically in the lock block above.
+  if (resumeStep > 0) {
+    await supabase
+      .from('wizard_sessions')
+      .update({ generation_status: 'generating', generation_step: resumeStep, last_error: null })
+      .eq('id', sessionId)
+  }
 
   // ── Helpers ───────────────────────────────────────────────────────────────
   const encoder = new TextEncoder()
@@ -354,6 +419,7 @@ export async function POST(req: Request) {
           error: wizError.message, errorType: wizError.type,
           action: wizError.action, fatal: false, resumeStep: prompt.step,
         }))
+        await supabase.from('wizard_sessions').update({ generation_status: 'partial' }).eq('id', sessionId)
         return null
       } else {
         controller.enqueue(sseEvent({
@@ -378,6 +444,10 @@ export async function POST(req: Request) {
           action: 'retrying', fatal: false, resumeStep: prompt.step,
         }))
         await new Promise(r => setTimeout(r, 3000))
+        // WZ-5: charge for the retry call — the original charge was refunded
+        // above when JSON parse failed, so deduct again for the retry attempt
+        const retryRunId = `${stepRunId}-jsonretry`
+        try { await deductCost(uid, stepModel, retryRunId) } catch { /* non-fatal */ }
         try {
           const jsonRetry = await callAI({
             userId:      uid,
@@ -399,12 +469,18 @@ export async function POST(req: Request) {
             controller.enqueue(sseEvent({ type: 'step_complete', step: prompt.step, label: prompt.label }))
             return retryParsed
           }
-        } catch { /* non-fatal — fall through */ }
+          // Retry call succeeded but JSON still invalid — refund retry charge
+          try { await refundCost(uid, stepModel, retryRunId) } catch { /* non-fatal */ }
+        } catch {
+          // Retry call itself failed — refund retry charge
+          try { await refundCost(uid, stepModel, retryRunId) } catch { /* non-fatal */ }
+        }
         controller.enqueue(sseEvent({
           type: 'step_error', step: prompt.step, label: prompt.label,
           error: 'Could not parse AI response. Blueprint will continue without this step.',
           errorType: 'parse_failed', action: 'change_model', fatal: false, resumeStep: prompt.step,
         }))
+        await supabase.from('wizard_sessions').update({ generation_status: 'partial' }).eq('id', sessionId)
         return null
       }
       controller.enqueue(sseEvent({
@@ -451,6 +527,11 @@ export async function POST(req: Request) {
   const stream = new ReadableStream({
     async start(controller) {
       try {
+
+        // W-12: warn early if no features were confirmed
+        if (featureWarning) {
+          controller.enqueue(sseEvent({ type: 'warning', message: featureWarning }))
+        }
 
         // ════════════════════════════════════════════════════════════════════
         //  WAVE 1 — Architecture + Phases run in parallel
@@ -665,10 +746,15 @@ async function saveBlueprint(params: {
 }) {
   const { supabase, projectId, projectName, blueprint } = params
 
-  // Run all deletes in parallel: same project-scoped cleanup
-  await Promise.all([
-    'graph_edges', 'graph_nodes', 'prompts', 'features', 'phases', 'contexts', 'wizard_sessions',
-  ].map(t => supabase.from(t).delete().eq('project_id', projectId)))
+  // Sequential cascade to respect FK constraints:
+  // edges → prompts → nodes → features → phases → contexts
+  // wizard_sessions is intentionally NOT deleted — it holds session state needed for resume/regen.
+  // WZ-4: contexts is deleted here as part of the cascade; the second delete
+  // that used to appear before the bulk context insert has been removed — it was
+  // a no-op that just added a redundant round-trip.
+  for (const t of ['graph_edges', 'prompts', 'graph_nodes', 'features', 'phases', 'contexts']) {
+    await supabase.from(t).delete().eq('project_id', projectId)
+  }
 
   // ── 2. Insert master prompt ───────────────────────────────────────────────
   if (blueprint.masterPrompt) {
@@ -700,7 +786,7 @@ async function saveBlueprint(params: {
 
   const { data: insertedPhases, error: phaseErr } = await supabase
     .from('phases')
-    .insert(phaseRows)
+    .upsert(phaseRows, { onConflict: 'project_id,name', ignoreDuplicates: false })
     .select('id, name, order_index')
 
   if (phaseErr) throw phaseErr
@@ -746,7 +832,7 @@ async function saveBlueprint(params: {
   if (featureRows.length > 0) {
     const { data, error: featErr } = await supabase
       .from('features')
-      .insert(featureRows)
+      .upsert(featureRows, { onConflict: 'project_id,phase_id,name', ignoreDuplicates: false })
       .select('id, name, phase_id')
     if (featErr) throw featErr
     insertedFeatures = data ?? []
@@ -933,8 +1019,7 @@ async function saveBlueprint(params: {
       ),
     )
 
-    // Delete existing context rows for this project then bulk insert fresh
-    await supabase.from('contexts').delete().eq('project_id', projectId)
+    // contexts was already deleted in the cascade loop above (WZ-4: removed duplicate delete)
     if (contextRows.length > 0) {
       const { error: ctxErr } = await supabase
         .from('contexts')

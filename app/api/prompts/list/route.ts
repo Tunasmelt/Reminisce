@@ -1,5 +1,7 @@
 import { NextResponse } from 'next/server'
-import { getServiceSupabase, supabase as clientSupabase, verifyProjectAccess } from '@/lib/supabase'
+import { getServiceSupabase, supabase as clientSupabase, verifyProjectAccess, isUserBanned } from '@/lib/supabase'
+
+const VALID_TABS = new Set(['blueprint', 'custom', 'changelog'])
 
 export const dynamic = 'force-dynamic'
 
@@ -15,9 +17,17 @@ export async function GET(req: Request) {
     if (!user || authError)
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
 
+    // PL-1: banned check
+    if (await isUserBanned(user.id))
+      return NextResponse.json({ error: 'Account suspended' }, { status: 403 })
+
     const { searchParams } = new URL(req.url)
     const projectId = searchParams.get('projectId')
-    const tab       = searchParams.get('tab') ?? 'blueprint'
+    const rawTab    = searchParams.get('tab') ?? 'blueprint'
+
+    // PL-2: reject unrecognised tab values — an unknown tab bypassed all filters
+    // and returned every prompt row for the project
+    const tab = VALID_TABS.has(rawTab) ? rawTab : 'blueprint'
 
     if (!projectId)
       return NextResponse.json({ error: 'Missing projectId' }, { status: 400 })
@@ -104,8 +114,7 @@ export async function GET(req: Request) {
 
     return NextResponse.json({ prompts: prompts ?? [] })
   } catch (error: unknown) {
-    const msg = error instanceof Error ? error.message : String(error)
-    console.error('List prompts error:', msg)
-    return NextResponse.json({ error: msg }, { status: 500 })
+    console.error('[prompts/list] error:', error)
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }
 }

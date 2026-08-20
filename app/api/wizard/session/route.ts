@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server'
-import { getServiceSupabase, supabase as clientSupabase, verifyProjectAccess, isUserBanned } from '@/lib/supabase'
+import { getServiceSupabase, supabase as clientSupabase, verifyProjectAccess, isUserBanned, getProjectRole } from '@/lib/supabase'
 import type { ConfirmedFeature, TechStackOption } from '@/lib/wizard-stages'
 
 export const dynamic = 'force-dynamic'
@@ -25,14 +25,20 @@ export async function PATCH(req: Request) {
     if (await isUserBanned(user.id))
       return NextResponse.json({ error: 'Account suspended' }, { status: 403 })
 
-    const body: {
+    let body: {
       sessionId: string
       confirmed_features?: ConfirmedFeature[]
       selected_stack?: TechStackOption
       stage?: string
-    } = await req.json()
+      completed_stages?: string[]
+    }
+    try {
+      body = await req.json()
+    } catch {
+      return NextResponse.json({ error: 'Invalid JSON body' }, { status: 400 })
+    }
 
-    const { sessionId, confirmed_features, selected_stack, stage } = body
+    const { sessionId, confirmed_features, selected_stack, stage, completed_stages } = body
 
     if (!sessionId)
       return NextResponse.json({ error: 'Missing sessionId' }, { status: 400 })
@@ -42,7 +48,7 @@ export async function PATCH(req: Request) {
     // Verify session belongs to a project this user owns
     const { data: session } = await supabase
       .from('wizard_sessions')
-      .select('id, project_id')
+      .select('id, project_id, stage')
       .eq('id', sessionId)
       .single()
 
@@ -52,18 +58,29 @@ export async function PATCH(req: Request) {
     if (!await verifyProjectAccess(user.id, session.project_id))
       return NextResponse.json({ error: 'Not found' }, { status: 404 })
 
+    const role = await getProjectRole(user.id, session.project_id)
+    if (role !== 'head') {
+      return NextResponse.json(
+        { error: 'Only the project head can run the Wizard' },
+        { status: 403 }
+      )
+    }
+
+    // W-15: reject stage rollback on terminal sessions
+    const TERMINAL = ['complete', 'generating']
+    if (stage !== undefined && TERMINAL.includes(session.stage) && !TERMINAL.includes(stage)) {
+      return NextResponse.json(
+        { error: 'Cannot roll back a completed or generating session' },
+        { status: 409 }
+      )
+    }
+
     // Build update — only write fields that were explicitly passed
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const update: Record<string, any> = {}
 
     if (confirmed_features !== undefined) {
       update.confirmed_features = confirmed_features
-      // When features are confirmed, advance stage to stack if still on features
-      if (stage === 'features') {
-        update.stage = 'stack'
-        update.completed_stages = supabase
-          // We'll handle this client-side — just update stage
-      }
     }
 
     if (selected_stack !== undefined) {
@@ -74,9 +91,9 @@ export async function PATCH(req: Request) {
       update.stage = stage
     }
 
-    // Remove the supabase reference that slipped in above
-    if ('completed_stages' in update && typeof update.completed_stages !== 'string') {
-      delete update.completed_stages
+    // W-9: accept completed_stages from client (was accidentally dropped before)
+    if (completed_stages !== undefined) {
+      update.completed_stages = completed_stages
     }
 
     const { error } = await supabase
@@ -88,7 +105,7 @@ export async function PATCH(req: Request) {
 
     return NextResponse.json({ ok: true })
   } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err)
-    return NextResponse.json({ error: msg }, { status: 500 })
+    console.error('[wizard/session] error:', err)
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }
 }

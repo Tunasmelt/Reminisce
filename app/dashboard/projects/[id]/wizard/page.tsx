@@ -18,6 +18,7 @@ import {
   FolderOpen,
   FileText,
 } from 'lucide-react'
+import { Project, Blueprint, GenerationEvent } from '@/types/project'
 import {
   STAGE_META,
   STAGE_ORDER,
@@ -29,12 +30,13 @@ import {
   type ConfirmedFeature,
   type TechStackOption,
   type WizardError,
+  type WizardModel,
   classifyError,
 } from '@/lib/wizard-stages'
 import { getTimeUntilUTCReset } from '@/lib/wallet'
 import { AIProvider } from '@/lib/ai-client'
 import { readSSEStream } from '@/lib/stream-parser'
-import { GenerationStepsPanel } from './BlueprintGenerationPanel'
+import { BlueprintGenerationPanel } from './BlueprintGenerationPanel'
 import { WizardChatPanel } from './WizardChatPanel'
 import { InjectModal } from './InjectModal'
 import { StageProgress, TechStackCard, FeatureCard, ModelSelector } from './WizardComponents'
@@ -44,31 +46,6 @@ import { StageProgress, TechStackCard, FeatureCard, ModelSelector } from './Wiza
 
 type Message = { role: 'user' | 'assistant' | 'system'; content: string }
 
-interface Blueprint {
-  architecture?: string
-  techStack?: Record<string, string>
-  phases?: Array<{
-    name: string
-    description: string
-    features?: Array<{ name: string; description: string; type?: string }>
-  }>
-  markdownFiles?: Record<string, string>
-  masterPromptTitle?: string
-}
-
-interface GenerationEvent {
-  type: 'wave_start' | 'step_start' | 'step_complete' | 'step_error'
-      | 'step_skip' | 'saving' | 'complete' | 'error'
-  wave?: number
-  step?: number
-  label?: string
-  description?: string
-  error?: string
-  action?: string
-  fatal?: boolean
-  resumeStep?: number
-  blueprint?: Blueprint
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Helpers
@@ -108,7 +85,7 @@ export default function WizardPage() {
   const { session } = useAuthStore()
 
   // ── State ──────────────────────────────────────────────────────────────────
-  const [project,            setProject]            = useState<{ name: string } | null>(null)
+  const [project,            setProject]            = useState<Project | null>(null)
   const [loading,            setLoading]            = useState(true)
   const [messages,           setMessages]           = useState<Message[]>([])
   const [inputMsg,           setInputMsg]           = useState('')
@@ -130,7 +107,7 @@ export default function WizardPage() {
   const [lastUserMessage,    setLastUserMessage]    = useState('')
   const [showInjectModal,    setShowInjectModal]    = useState(false)
   const [showRegenConfirm,   setShowRegenConfirm]   = useState(false)
-  const [models, setModels] = useState(FALLBACK_MODELS)
+  const [availableModels,    setAvailableModels]    = useState<WizardModel[]>([])
   const [selectedModel, setSelectedModel] = useState<string>(() =>
     typeof window !== 'undefined' ? (localStorage.getItem('wizard_model') || 'llama-3.1-8b-instant') : 'llama-3.1-8b-instant'
   )
@@ -165,11 +142,14 @@ export default function WizardPage() {
   })
 
   // ── Refs ───────────────────────────────────────────────────────────────────
-  const containerRef    = useRef<HTMLDivElement>(null)
-  const isDragging      = useRef(false)
-  const isGeneratingRef = useRef(false)
-  const initialized     = useRef(false)
-  const sessionIdRef    = useRef<string | null>(null)
+  const containerRef      = useRef<HTMLDivElement>(null)
+  const isDragging        = useRef(false)
+  const isGeneratingRef   = useRef(false)
+  const initialized       = useRef(false)
+  const sessionIdRef      = useRef<string | null>(null)
+  // WZ-1: AbortController for the active generate/chat SSE stream so we can
+  // cancel it cleanly on unmount (page navigation during generation).
+  const streamAbortRef    = useRef<AbortController | null>(null)
   const currentStageRef = useRef<WizardStageKey>('idea')
   const rightPanelRef   = useRef<HTMLDivElement>(null)
   const dragFrom        = useRef<number | null>(null)
@@ -177,6 +157,11 @@ export default function WizardPage() {
 
   const { isConnected, folderName, isSupported, openFolder, writeFile, initProject, pushToLocal } =
     useFileSystem(projectId)
+
+  // WZ-1: Cancel any in-flight generate/chat SSE stream on unmount.
+  useEffect(() => {
+    return () => { streamAbortRef.current?.abort() }
+  }, [])
 
   // ── Drag resize ────────────────────────────────────────────────────────────
   const onDragStart = useCallback((e: React.MouseEvent) => {
@@ -208,8 +193,9 @@ export default function WizardPage() {
     if (initialized.current) return
     initialized.current = true
     const init = async () => {
+      try {
       const [{ data: proj }, { data: sessions }] = await Promise.all([
-        supabase.from('projects').select('name').eq('id', projectId).single(),
+        supabase.from('projects').select('*').eq('id', projectId).single(),
         supabase.from('wizard_sessions').select('*').eq('project_id', projectId)
           .order('created_at', { ascending: false }).limit(1),
       ])
@@ -264,36 +250,55 @@ export default function WizardPage() {
         if (sess.generation_status === 'generating') { setGenCurrentStep(sess.generation_step ?? 0); setResumeStep(sess.generation_step ?? 0) }
         if (sess.last_error) setActiveError(classifyError(new Error(sess.last_error)))
       }
-      setSelectedModel(prev => {
-        const known = models.some(m => m.model === prev)
-        if (!known) { localStorage.setItem('wizard_model', 'llama-3.1-8b-instant'); localStorage.setItem('wizard_provider', 'groq'); setSelectedProvider('groq'); return 'llama-3.1-8b-instant' }
-        return prev
-      })
-      setLoading(false)
+      } catch (err) {
+        console.error('[wizard] init error:', err)
+      } finally {
+        setLoading(false)
+      }
     }
     init()
-  }, [projectId, models])
+  }, [projectId])
 
   useEffect(() => {
-    supabase.auth.getSession().then(({ data: { session } }) => {
-      if (!session) return
-      fetch('/api/keys/models', {
-        headers: { Authorization: `Bearer ${session.access_token}` },
-      })
-        .then(r => r.json())
-        .then(data => {
-          if (Array.isArray(data.models) && data.models.length > 0) {
-            setModels(data.models)
-          }
+    const fetchModels = async () => {
+      try {
+        const { data: { session: authSession } } = await supabase.auth.getSession()
+        if (!authSession) return
+
+        const res = await fetch('/api/keys/models', {
+          headers: { Authorization: `Bearer ${authSession.access_token}` },
         })
-        .catch(() => { /* keep FALLBACK_MODELS */ })
-    })
+        if (res.ok) {
+          const data = await res.json()
+          if (Array.isArray(data.models) && data.models.length > 0) {
+            // Map to WizardModel shape (ensure badge exists)
+            const models = data.models.map((m: WizardModel & { badge?: string }) => ({ ...m, badge: m.badge ?? '' }))
+            setAvailableModels(models)
+            // W-7: validate stored model against current available list — fallback to first if stale
+            const storedModel = typeof window !== 'undefined' ? localStorage.getItem('wizard_model') : null
+            if (storedModel && !models.some((m: WizardModel) => m.model === storedModel)) {
+              const first = models[0]
+              setSelectedModel(first.model)
+              setSelectedProvider(first.provider as AIProvider)
+              localStorage.setItem('wizard_model', first.model)
+              localStorage.setItem('wizard_provider', first.provider)
+            }
+          }
+        }
+      } catch (err) { 
+        console.error('Failed to fetch models:', err)
+        // Fallback to static models if API fails
+        setAvailableModels([...FALLBACK_MODELS])
+      }
+    }
+    fetchModels()
   }, [])
 
   // ── Send message ───────────────────────────────────────────────────────────
   const handleSendMessage = useCallback(async (overrideMsg?: string) => {
     const text = overrideMsg ?? inputMsg
     if (!text.trim() || isTyping || isGenerating) return
+    if (!session?.access_token) { toast.error('Session expired. Please refresh the page.'); return }
     const currentInput = text.trim()
     setInputMsg('')
     setLastUserMessage(currentInput)
@@ -301,10 +306,15 @@ export default function WizardPage() {
     setMessages(prev => [...prev, { role: 'user', content: currentInput }])
     setIsTyping(true)
     try {
+      // WZ-1: register AbortController for unmount cleanup.
+      const chatAbort = new AbortController()
+      streamAbortRef.current = chatAbort
+
       const res = await fetch('/api/wizard/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${session?.access_token}` },
         body: JSON.stringify({ sessionId: sessionIdRef.current, projectId, message: currentInput, provider: selectedProvider, model: selectedModel }),
+        signal: chatAbort.signal,
       })
       if (!res.ok) {
         const errBody = await res.json().catch(() => ({}))
@@ -355,10 +365,12 @@ export default function WizardPage() {
       }
       if (!assistantText.trim()) { setActiveError(classifyError(new Error('stream died'))); setInputMsg(currentInput) }
     } catch (err: unknown) {
+      // WZ-1: AbortError = user navigated away — don't flash an error.
+      if (err instanceof Error && err.name === 'AbortError') return
       const wizError = classifyError(err); setActiveError(wizError)
       setMessages(prev => { const arr = [...prev]; if (arr[arr.length - 1]?.role === 'assistant') arr.pop(); if (arr[arr.length - 1]?.role === 'user') arr.pop(); return arr })
       setInputMsg(currentInput)
-    } finally { setIsTyping(false) }
+    } finally { setIsTyping(false); streamAbortRef.current = null }
   }, [inputMsg, isTyping, isGenerating, projectId, session, selectedProvider, selectedModel])
 
   // ── Confirm features ───────────────────────────────────────────────────────
@@ -366,16 +378,26 @@ export default function WizardPage() {
     const toConfirm = pendingFeatures.filter(f => f.confirmed)
     if (toConfirm.length === 0) { toast.error('Select at least one feature.'); return }
     try {
-      await fetch('/api/wizard/session', {
+      const newCompleted = completedStages.includes('features') ? completedStages : [...completedStages, 'features' as import('@/lib/wizard-stages').WizardStageKey]
+      const res = await fetch('/api/wizard/session', {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${session?.access_token}` },
-        body: JSON.stringify({ sessionId: sessionIdRef.current, confirmed_features: toConfirm, stage: 'stack' }),
+        body: JSON.stringify({
+          sessionId: sessionIdRef.current,
+          confirmed_features: toConfirm,
+          stage: 'stack',
+          completed_stages: newCompleted,
+        }),
       })
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}))
+        throw new Error(body.error ?? 'Failed to save features')
+      }
       setCurrentStage('stack'); currentStageRef.current = 'stack'
-      setCompletedStages(prev => prev.includes('features') ? prev : [...prev, 'features'])
+      setCompletedStages(newCompleted)
       toast.success(`${toConfirm.length} features confirmed`)
-    } catch { toast.error('Failed to save features.') }
-  }, [pendingFeatures, session])
+    } catch (err) { toast.error(err instanceof Error ? err.message : 'Failed to save features.') }
+  }, [pendingFeatures, session, completedStages])
 
   // ── Generate blueprint ─────────────────────────────────────────────────────
   const handleGenerate = useCallback(async (fromResumeStep = 0, force = false) => {
@@ -387,26 +409,54 @@ export default function WizardPage() {
 
     if (isGeneratingRef.current) return
     const sid = sessionIdRef.current; if (!sid) return
-    
+    if (!session?.access_token) { toast.error('Session expired. Please refresh the page.'); return }
+
     setIsRegeneration(!!generatedBlueprint && fromResumeStep === 0)
     isGeneratingRef.current = true; setIsGenerating(true)
     setCurrentStage('generating'); setGenCurrentStep(fromResumeStep)
     setGenCompletedSteps(Array.from({ length: fromResumeStep }, (_, i) => i))
     setGenErrorStep(null); setActiveError(null)
     try {
+      // WZ-1: register AbortController so unmount (navigation away) can cancel
+      // the long-running generate stream cleanly.
+      const abortCtrl = new AbortController()
+      streamAbortRef.current = abortCtrl
+
       const res = await fetch('/api/wizard/generate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${session?.access_token}` },
         body: JSON.stringify({ sessionId: sid, projectId, provider: selectedProvider, model: selectedModel, resumeStep: fromResumeStep }),
+        signal: abortCtrl.signal,
       })
       if (!res.ok) {
         if (res.status === 402) {
           setActiveError({ type: 'rate_limit', message: `Out of coins. Resets ${getTimeUntilUTCReset()}.`, actionLabel: 'Change Model', action: 'change_model' })
           setCurrentStage('stack'); return
+        } else if (res.status === 409) {
+          const body = await res.json().catch(() => ({}))
+          if (body.error === 'generation_in_progress') {
+            setActiveError({
+              type: 'rate_limit',
+              message: 'Generation is already running. Please wait for it to complete.',
+              actionLabel: 'Wait',
+              action: 'wait',
+            })
+          } else {
+            setActiveError({
+              type: 'stage_error',
+              message: body.message || 'Wizard session not ready. Complete all stages first.',
+              actionLabel: 'Restart',
+              action: 'restart',
+            })
+          }
+          setIsGenerating(false)
+          setCurrentStage('stack')
+          return
         }
         const errBody = await res.json().catch(() => ({})); throw new Error(errBody?.error ?? 'Generation failed')
       }
       const reader = res.body?.getReader(); const decoder = new TextDecoder(); let buffer = ''
+      let streamComplete = false
       if (reader) {
         while (true) {
           const { done, value } = await reader.read(); if (done) break
@@ -422,6 +472,7 @@ export default function WizardPage() {
                 case 'step_complete': setGenCompletedSteps(prev => [...prev, event.step ?? 0]); break
                 case 'step_error':    setGenErrorStep(event.step ?? null); if (event.resumeStep !== undefined) setResumeStep(event.resumeStep); break
                 case 'complete':
+                  streamComplete = true
                   setGeneratedBlueprint(event.blueprint ?? null)
                   setCurrentStage('complete'); currentStageRef.current = 'complete'
                   setCompletedStages(['idea', 'features', 'stack', 'generating'])
@@ -431,6 +482,7 @@ export default function WizardPage() {
                   }
                   break
                 case 'error':
+                  streamComplete = true // error is also a terminal event
                   if (event.error) {
                     setActiveError({ ...classifyError(new Error(event.error)), action: (event.action as WizardError['action']) ?? 'retry' })
                     if (event.resumeStep !== undefined) setResumeStep(event.resumeStep)
@@ -439,9 +491,18 @@ export default function WizardPage() {
             } catch { /* partial */ }
           }
         }
+        // W-11: stream closed without a complete/error event — likely network drop
+        if (!streamComplete) {
+          setActiveError({ type: 'network', message: 'Stream closed unexpectedly. Please retry.', actionLabel: 'Retry', action: 'retry' })
+          setCurrentStage('stack')
+        }
       }
-    } catch (err: unknown) { setActiveError(classifyError(err)); setCurrentStage('stack') }
-    finally { isGeneratingRef.current = false; setIsGenerating(false) }
+    } catch (err: unknown) {
+      // WZ-1: AbortError means the user navigated away — don't show an error UI.
+      if (err instanceof Error && err.name === 'AbortError') return
+      setActiveError(classifyError(err)); setCurrentStage('stack')
+    }
+    finally { isGeneratingRef.current = false; setIsGenerating(false); streamAbortRef.current = null }
   }, [projectId, session, selectedProvider, selectedModel, generatedBlueprint, setShowRegenConfirm, isRegeneration])
 
   // ── Select stack ───────────────────────────────────────────────────────────
@@ -500,9 +561,10 @@ export default function WizardPage() {
       }
       if (written > 0) {
         toast.success(`${written} files written to folder`)
-        // Persist sync timestamp — overview page reads this to show indicator
         const syncedAt = new Date().toISOString()
         localStorage.setItem(`blueprint_synced_${projectId}`, syncedAt)
+      } else {
+        toast.error('No files were written. Check your folder connection and try again.')
       }
     } catch { toast.error('File injection failed') }
   }, [generatedBlueprint, initProject, writeFile, projectId])
@@ -621,13 +683,15 @@ export default function WizardPage() {
           </span>
           <div style={{ flex: 1 }} />
           <ModelSelector
-            models={models}
+            models={availableModels.length > 0 ? availableModels : FALLBACK_MODELS}
             selectedModel={selectedModel}
             onSelect={(m, p) => {
               setSelectedModel(m); setSelectedProvider(p)
               localStorage.setItem('wizard_model', m); localStorage.setItem('wizard_provider', p)
-              if (messages.length > 0)
-                setMessages(prev => [...prev, { role: 'assistant', content: `↺ Switched to ${models.find(x => x.model === m)?.label ?? m}. I have full context of our conversation.` }])
+              if (messages.length > 0) {
+                const label = (availableModels.length > 0 ? availableModels : FALLBACK_MODELS).find(x => x.model === m)?.label ?? m
+                setMessages(prev => [...prev, { role: 'assistant', content: `↺ Switched to ${label}. I have full context of our conversation.` }])
+              }
             }}
             accent={ac}
           />
@@ -774,7 +838,7 @@ export default function WizardPage() {
               ) : (
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
                   {pendingFeatures.map((f, i) => (
-                    <div key={i} draggable onDragStart={() => handleDragStart(i)} onDragOver={handleDragOver} onDrop={() => handleDrop(i)}>
+                    <div key={f.name || String(i)} draggable onDragStart={() => handleDragStart(i)} onDragOver={handleDragOver} onDrop={() => handleDrop(i)}>
                       <FeatureCard
                         feature={f} accent={ac}
                         onToggle={() => handleFeatureToggle(i)}
@@ -839,7 +903,20 @@ export default function WizardPage() {
 
           {/* Generation progress */}
           {rightPanelMode === 'generating' && (
-            <GenerationStepsPanel steps={GENERATION_STEPS} currentStep={genCurrentStep} completedSteps={genCompletedSteps} errorStep={genErrorStep} accent={ac} />
+            <BlueprintGenerationPanel
+              steps={GENERATION_STEPS}
+              genCurrentStep={genCurrentStep}
+              completedSteps={genCompletedSteps}
+              genErrorStep={genErrorStep}
+              resumeStep={resumeStep}
+              accent={ac}
+              onRetry={(fromStep) => {
+                // Reset error state then retry from the failed step
+                setGenErrorStep(null)
+                setActiveError(null)
+                handleGenerate(fromStep, false)
+              }}
+            />
           )}
 
           {/* Complete — preview tab */}
