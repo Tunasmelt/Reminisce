@@ -51,10 +51,13 @@ export async function GET(req: Request) {
   if (e7 || e8 || e9) console.error('[Stats] Activity query error:', { e7, e8, e9 })
 
   // 4. Economy
-  const { data: walletSums, error: e10 } = await sb.from('user_wallets').select('coins, gems')
-  if (e10) console.error('[Stats] Wallet query error:', e10)
-  const totalCoins = (walletSums || []).reduce((acc, w) => acc + (w.coins || 0), 0)
-  const totalGems = (walletSums || []).reduce((acc, w) => acc + (w.gems || 0), 0)
+  // AD-10: Use DB-level aggregate RPC instead of fetching all wallet rows into
+  // JS and reducing — the previous approach was a full table scan that grew
+  // linearly with every new user.
+  const { data: walletAgg, error: e10 } = await sb.rpc('sum_wallet_balances')
+  if (e10) console.error('[Stats] Wallet aggregate error:', e10)
+  const totalCoins = (walletAgg as { total_coins: number } | null)?.total_coins ?? 0
+  const totalGems  = (walletAgg as { total_gems:  number } | null)?.total_gems  ?? 0
 
   // Recent signups
   const { data: recentSignupRows, error: e11 } = await sb

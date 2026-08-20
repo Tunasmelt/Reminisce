@@ -1,6 +1,8 @@
 import { NextResponse } from 'next/server'
 import { verifyAdmin } from '@/lib/admin-auth'
 import { getServiceSupabase } from '@/lib/supabase'
+import { ensureWallet } from '@/lib/wallet'
+import { writeAuditLog } from '@/lib/admin-audit'
 
 export const dynamic = 'force-dynamic'
 
@@ -11,7 +13,12 @@ export async function PATCH(
   const check = await verifyAdmin(req.headers.get('authorization'))
   if (!check.ok) return check.response
 
-  const body = await req.json()
+  let body: { action?: string; value?: unknown; reason?: string; notes?: string }
+  try {
+    body = await req.json()
+  } catch {
+    return NextResponse.json({ error: 'Invalid JSON body' }, { status: 400 })
+  }
   const sb = getServiceSupabase()
   const targetUserId = params.id
 
@@ -20,67 +27,59 @@ export async function PATCH(
 
   if (!action) return NextResponse.json({ error: 'action required' }, { status: 400 })
 
+  // AD-1: Prevent admins from taking destructive actions on their own account.
+  // ban / remove_admin / downgrade_free on self causes immediate self-lockout.
+  const SELF_DESTRUCTIVE_ACTIONS = ['ban', 'remove_admin', 'downgrade_free']
+  if (SELF_DESTRUCTIVE_ACTIONS.includes(action) && targetUserId === check.userId)
+    return NextResponse.json(
+      { error: `Cannot perform "${action}" on your own account` },
+      { status: 400 },
+    )
+
   try {
     let updateError = null
 
     switch (action) {
       case 'upgrade_pro': {
-        const { error: err1 } = await sb.from('user_plans').update({
-          plan: 'pro',
-          status: 'active',
-          projects_limit: 999,
-          updated_at: new Date().toISOString(),
-        }).eq('user_id', targetUserId)
-        
-        const { error: err2 } = await sb.from('user_wallets').update({
-          daily_coins_limit: 200,
-          max_coins_banked: 500,
-          gems_monthly_grant: 100,
-          updated_at: new Date().toISOString(),
-        }).eq('user_id', targetUserId)
-        
-        updateError = err1 || err2
+        // A5: Atomic — admin_set_plan updates user_plans AND user_wallets in one
+        // transaction, so the two tables can never drift (the old code did two
+        // separate UPDATEs and only logged the inconsistency on partial failure).
+        const { error } = await sb.rpc('admin_set_plan', {
+          p_user_id: targetUserId,
+          p_plan:    'pro',
+        })
+        updateError = error
         break
       }
       case 'downgrade_free': {
-        const { error: err1 } = await sb.from('user_plans').update({
-          plan: 'free',
-          status: 'active',
-          projects_limit: 2,
-          stripe_subscription_id: null,
-          updated_at: new Date().toISOString(),
-        }).eq('user_id', targetUserId)
-        
-        const { error: err2 } = await sb.from('user_wallets').update({
-          daily_coins_limit: 50,
-          max_coins_banked: 200,
-          gems_monthly_grant: 0,
-          updated_at: new Date().toISOString(),
-        }).eq('user_id', targetUserId)
-        
-        updateError = err1 || err2
+        const { error } = await sb.rpc('admin_set_plan', {
+          p_user_id: targetUserId,
+          p_plan:    'free',
+        })
+        updateError = error
         break
       }
       case 'add_coins': {
-        const amount = parseInt(value) || 0
+        const amount = parseInt(String(value), 10) || 0
         if (amount <= 0 || amount > 10000) {
           return NextResponse.json({ error: 'amount must be 1–10000' }, { status: 400 })
         }
-        const { data: wallet } = await sb.from('user_wallets')
-          .select('coins').eq('user_id', targetUserId).single()
-        const newCoins = (wallet?.coins || 0) + amount
-        const { error: err } = await sb.from('user_wallets').update({
-          coins: newCoins,
-          updated_at: new Date().toISOString(),
-        }).eq('user_id', targetUserId)
-        
+        await ensureWallet(targetUserId)
+        // AD-5: Atomic increment via SQL expression — avoids the read-then-write
+        // TOCTOU race where two concurrent admin grants both read the same balance
+        // and one increment is silently lost.
+        const { error: err } = await sb.rpc('increment_wallet_field', {
+          p_user_id: targetUserId,
+          p_field:   'coins',
+          p_amount:  amount,
+        })
         if (!err) {
           await sb.from('wallet_transactions').insert({
-            user_id: targetUserId,
-            type: 'credit',
+            user_id:            targetUserId,
+            type:               'credit',
             amount,
-            currency: 'coins',
-            description: `Admin grant by ${check.userId}`,
+            currency:           'coins',
+            description:        `Admin grant by ${check.userId}`,
             transaction_source: 'admin_grant',
           })
         }
@@ -88,25 +87,24 @@ export async function PATCH(
         break
       }
       case 'add_gems': {
-        const amount = parseInt(value) || 0
+        const amount = parseInt(String(value), 10) || 0
         if (amount <= 0 || amount > 1000) {
           return NextResponse.json({ error: 'amount must be 1–1000' }, { status: 400 })
         }
-        const { data: wallet } = await sb.from('user_wallets')
-          .select('gems').eq('user_id', targetUserId).single()
-        const newGems = (wallet?.gems || 0) + amount
-        const { error: err } = await sb.from('user_wallets').update({
-          gems: newGems,
-          updated_at: new Date().toISOString(),
-        }).eq('user_id', targetUserId)
-        
+        await ensureWallet(targetUserId)
+        // AD-5: Same atomic increment pattern as add_coins.
+        const { error: err } = await sb.rpc('increment_wallet_field', {
+          p_user_id: targetUserId,
+          p_field:   'gems',
+          p_amount:  amount,
+        })
         if (!err) {
           await sb.from('wallet_transactions').insert({
-            user_id: targetUserId,
-            type: 'credit',
+            user_id:            targetUserId,
+            type:               'credit',
             amount,
-            currency: 'gems',
-            description: `Admin grant by ${check.userId}`,
+            currency:           'gems',
+            description:        `Admin grant by ${check.userId}`,
             transaction_source: 'admin_grant',
           })
         }
@@ -147,6 +145,18 @@ export async function PATCH(
         break
       }
       case 'remove_admin': {
+        // AD-2: Prevent removing the last admin — if this is the only admin row,
+        // removing it leaves the system with zero admins and no recovery path
+        // short of direct DB access.
+        const { count: adminCount } = await sb
+          .from('user_plans')
+          .select('user_id', { count: 'exact', head: true })
+          .eq('is_admin', true)
+        if ((adminCount ?? 0) <= 1)
+          return NextResponse.json(
+            { error: 'Cannot remove the last admin. Promote another user first.' },
+            { status: 400 },
+          )
         const { error: err } = await sb.from('user_plans').update({
           is_admin: false, updated_at: new Date().toISOString(),
         }).eq('user_id', targetUserId)
@@ -159,24 +169,22 @@ export async function PATCH(
 
     if (updateError) {
       console.error('[AdminAPI] Update error:', updateError)
-      return NextResponse.json({ error: updateError.message }, { status: 500 })
+      return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
     }
 
-    await sb.from('admin_logs').insert({
-      admin_id:    check.userId,
+    // AD-3 / A8: Non-fatal audit write via the shared helper.
+    await writeAuditLog({
+      adminId:    check.userId,
       action,
-      target_user: targetUserId,
-      target_id:   targetUserId,
-      target_type: 'user',
-      payload:     body,
-      details:     body,
+      targetId:   targetUserId,
+      targetType: 'user',
+      metadata:   body as Record<string, unknown>,
     })
 
     return NextResponse.json({ ok: true, action, targetUserId })
   } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err)
     console.error('[AdminAPI] Fatal error:', err)
-    return NextResponse.json({ error: msg }, { status: 500 })
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }
 }
 
@@ -190,51 +198,47 @@ export async function DELETE(
   const sb = getServiceSupabase()
   const targetUserId = params.id
 
+  // AD-4: Prevent self-deletion — an admin deleting their own account via this
+  // route would cascade-delete all their workspaces/projects and call
+  // auth.admin.deleteUser on themselves, irreversibly destroying their account.
+  if (targetUserId === check.userId)
+    return NextResponse.json(
+      { error: 'Cannot delete your own admin account' },
+      { status: 400 },
+    )
+
   try {
-    // 1. Delete wallet_transactions (no cascade)
-    await sb.from('wallet_transactions').delete().eq('user_id', targetUserId)
-
-    // 2. Delete pam_messages, pam_threads (no direct user cascade on messages)
-    await sb.from('pam_threads').delete().eq('user_id', targetUserId)
-
-    // 3. Delete user_wallets and user_plans
-    await sb.from('user_wallets').delete().eq('user_id', targetUserId)
-    await sb.from('user_plans').delete().eq('user_id', targetUserId)
-
-    // 4. Delete workspaces (cascades to projects, phases, features, contexts)
-    const { data: workspaces } = await sb
-      .from('workspaces')
-      .select('id')
-      .eq('owner_id', targetUserId)
-
-    if (workspaces && workspaces.length > 0) {
-      await sb
-        .from('workspaces')
-        .delete()
-        .in('id', workspaces.map(w => w.id))
+    // A1: Atomic deletion. Every user-owned table cascades from auth.users
+    // (directly, or via workspaces → projects), so deleting the auth row removes
+    // ALL of the user's data in one transaction. admin_delete_user is a
+    // SECURITY DEFINER RPC that does exactly `DELETE FROM auth.users WHERE id=…`.
+    //
+    // This replaces the old approach of 6 sequential, non-transactional manual
+    // deletes that ran BEFORE a *non-fatal* auth delete — an ordering that could
+    // wipe a user's plan/wallet/workspaces while leaving them able to log in
+    // (a zombie account that errors on every page load). Here the delete is
+    // all-or-nothing and its failure is fatal.
+    const { error: delErr } = await sb.rpc('admin_delete_user', {
+      p_user_id: targetUserId,
+    })
+    if (delErr) {
+      console.error('[Admin DELETE] admin_delete_user error:', delErr)
+      return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
     }
 
-    // 5. Delete from Supabase Auth (removes login ability)
-    const { error: authErr } = await sb.auth.admin.deleteUser(targetUserId)
-    if (authErr) {
-      console.error('[Admin DELETE] Auth delete error:', authErr)
-      // Non-fatal — data is already cleaned up
-    }
-
-    // 6. Log the deletion
-    await sb.from('admin_logs').insert({
-      admin_id:    check.userId,
-      action:      'delete_user',
-      target_id:   targetUserId,
-      target_type: 'user',
-      payload:     { userId: targetUserId },
-      details:     { userId: targetUserId },
+    // Audit AFTER successful deletion. The helper writes target_id (plain text,
+    // no FK), so referencing the now-deleted user id does not violate any FK.
+    await writeAuditLog({
+      adminId:    check.userId,
+      action:     'delete_user',
+      targetId:   targetUserId,
+      targetType: 'user',
+      metadata:   { userId: targetUserId },
     })
 
     return NextResponse.json({ ok: true, deleted: targetUserId })
   } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err)
     console.error('[Admin DELETE] Error:', err)
-    return NextResponse.json({ error: msg }, { status: 500 })
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }
 }

@@ -26,15 +26,23 @@ export async function GET(req: Request) {
     `, { count: 'exact' })
 
   if (search && search.includes('@')) {
-    // Search auth users by email first
-    const { data: authSearch } = await sb.auth.admin.listUsers()
-    const matchedIds = (authSearch?.users ?? [])
-      .filter(u => u.email?.toLowerCase().includes(search.toLowerCase()))
-      .map(u => u.id)
+    // AD-6: Paginate the auth user scan — the previous code called listUsers()
+    // with no pagination, fetching all users into memory in a single call.
+    // For large user bases this causes OOM. Use the same paginated pattern as
+    // team/members and team/invite routes (max 50 pages = 5000 users).
+    const searchLower = search.toLowerCase()
+    const matchedIds: string[] = []
+    for (let p = 1; p <= 50; p++) {
+      const { data: batch } = await sb.auth.admin.listUsers({ perPage: 100, page: p })
+      if (!batch?.users || batch.users.length === 0) break
+      batch.users.forEach(u => {
+        if (u.email?.toLowerCase().includes(searchLower)) matchedIds.push(u.id)
+      })
+      if (batch.users.length < 100) break
+    }
     if (matchedIds.length > 0) {
       query = query.in('user_id', matchedIds)
     } else {
-      // No matches — return empty
       return NextResponse.json({ users: [], total: 0, page, limit })
     }
   } else if (search) {
@@ -50,7 +58,10 @@ export async function GET(req: Request) {
     .order('created_at', { ascending: false })
 
   const { data, error, count } = await query
-  if (error) return NextResponse.json({ error: error.message }, { status: 500 })
+  if (error) {
+    console.error('[admin/users] Query error:', error)
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
+  }
 
   // Fetch wallet data for each user
   const userIds = (data || []).map(u => u.user_id)
@@ -95,17 +106,27 @@ export async function GET(req: Request) {
     }
   }
 
-  // Fetch project counts — join through workspaces to get owner_id
-  const { data: pData } = await sb
-    .from('projects')
-    .select('id, workspaces!inner(owner_id)')
-
+  // AD-7: Scope project count query to the current page's user IDs only.
+  // The previous query fetched ALL projects from the DB regardless of which
+  // users were on the current page — a full table scan growing with every project.
   const pCounts: Record<string, number> = {}
-  if (pData) {
-    (pData as unknown as Array<{ workspaces: { owner_id: string } }>).forEach((p) => {
-      const oid = p.workspaces?.owner_id
-      if (oid) pCounts[oid] = (pCounts[oid] || 0) + 1
-    })
+  if (userIds.length > 0) {
+    const { data: pData } = await sb
+      .from('workspaces')
+      .select('owner_id')
+      .in('owner_id', userIds)
+    if (pData) {
+      // Count projects per owner by fetching project counts scoped to these workspaces
+      const { data: projData } = await sb
+        .from('projects')
+        .select('id, workspaces!inner(owner_id)')
+        .in('workspaces.owner_id' as never, userIds)
+      ;(projData as unknown as Array<{ workspaces: { owner_id: string } }> ?? [])
+        .forEach(p => {
+          const oid = p.workspaces?.owner_id
+          if (oid) pCounts[oid] = (pCounts[oid] || 0) + 1
+        })
+    }
   }
 
   const users = (data || []).map(u => ({

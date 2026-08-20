@@ -10,7 +10,7 @@ export async function GET(req: Request) {
   if (!auth.ok) return auth.response
 
   const sb = getServiceSupabase()
-  const { data, error } = await sb
+  const { data } = await sb
     .from('admin_logs')
     .select('*')
     .order('created_at', { ascending: false })
