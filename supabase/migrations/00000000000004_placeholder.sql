@@ -1,1 +1,0 @@
--- Originally: 00000000000004_init.sql | Feature: placeholder
