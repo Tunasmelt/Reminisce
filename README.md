@@ -70,21 +70,13 @@ GROQ_API_KEY=your-groq-key
 ```
 
 ### 3. Run database migrations
-In Supabase Dashboard → SQL Editor, run each migration file in order:
+In Supabase Dashboard → SQL Editor, run the canonical reset script — this single file is a complete cold install:
 ```
-supabase/migrations/00000000000000_core_schema.sql
-supabase/migrations/00000000000001_economy_and_wallet.sql
-supabase/migrations/00000000000002_graph_and_board.sql
-supabase/migrations/00000000000005_pam_threads.sql
-supabase/migrations/00000000000006_pam_phase2_and_prompts.sql
-supabase/migrations/00000000000007_project_reminders.sql
-supabase/migrations/00000000000008_context_sync_and_git.sql
-supabase/migrations/00000000000009_admin_and_models.sql
-supabase/migrations/00000000000010_missing_columns_and_templates.sql
-supabase/migrations/00000000000011_admin_logs_columns.sql
+supabase/migrations/00000000000099_complete_reset_schema.sql
 ```
+It creates the full schema, row-level security (RLS), all functions/RPCs, and seeds the default model catalogue in one run. **No other migration files are required for a fresh install** — migrations `0035`–`0038` are already folded into this script.
 
-Skip `00000000000004` (placeholder file).
+_Optional:_ run `supabase/migrations/0000000000039_models_rehaul.sql` afterward to refresh the model catalogue to the current verified-live set (it only touches model data, not schema).
 
 ### 4. Start dev server
 ```bash
