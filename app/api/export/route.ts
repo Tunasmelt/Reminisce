@@ -1,25 +1,44 @@
 import { NextResponse } from 'next/server'
 import JSZip from 'jszip'
-import { getServiceSupabase, supabase as clientSupabase } from '@/lib/supabase'
+import { getServiceSupabase, isUserBanned } from '@/lib/supabase'
+import { authenticateRequest } from '@/lib/api-auth'
 
 export const dynamic = 'force-dynamic'
+
+// EX-1: caps to prevent OOM while building the ZIP in memory
+const MAX_FILE_ENTRIES = 500
+const MAX_TOTAL_CONTENT_BYTES = 50 * 1024 * 1024 // 50 MB
 
 export async function POST(req: Request) {
   try {
     // ── Auth ─────────────────────────────────────────────────────────────────
-    const authHeader = req.headers.get('authorization')
-    if (!authHeader)
-      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+    const { user, errorResponse } = await authenticateRequest(req)
+    if (errorResponse) return errorResponse
 
-    const token = authHeader.replace('Bearer ', '')
-    const { data: { user }, error: authError } =
-      await clientSupabase.auth.getUser(token)
-    if (!user || authError)
-      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+    // EX-4: banned check
+    if (await isUserBanned(user.id))
+      return NextResponse.json({ error: 'Account suspended' }, { status: 403 })
 
-    const { projectId, files } = await req.json()
+    // EX-3: guard JSON parse so bad body returns 400 not 500
+    let body: { projectId?: string; files?: Record<string, unknown> }
+    try {
+      body = await req.json()
+    } catch {
+      return NextResponse.json({ error: 'Invalid JSON body' }, { status: 400 })
+    }
+    const { projectId, files } = body
+
     if (!projectId || !files)
       return NextResponse.json({ error: 'Missing projectId or files' }, { status: 400 })
+
+    // EX-1: cap entry count before doing any work
+    const entries = Object.entries(files)
+    if (entries.length > MAX_FILE_ENTRIES) {
+      return NextResponse.json(
+        { error: `Export limited to ${MAX_FILE_ENTRIES} files. Received ${entries.length}.` },
+        { status: 400 },
+      )
+    }
 
     // ── Ownership check ───────────────────────────────────────────────────────
     // Verify the project belongs to this user's workspace
@@ -35,10 +54,29 @@ export async function POST(req: Request) {
 
     // ── Build zip ────────────────────────────────────────────────────────────
     const zip = new JSZip()
-    for (const [path, content] of Object.entries(files)) {
-      // Sanitise path — prevent directory traversal
-      const safePath = String(path).replace(/\.\.\//g, '').replace(/^\//, '')
-      zip.file(`reminisce/${safePath}`, content as string)
+    let totalBytes = 0
+    for (const [path, content] of entries) {
+      const contentStr = String(content ?? '')
+
+      // EX-1: check cumulative size
+      totalBytes += new TextEncoder().encode(contentStr).length
+      if (totalBytes > MAX_TOTAL_CONTENT_BYTES) {
+        return NextResponse.json(
+          { error: `Total export size exceeds the ${MAX_TOTAL_CONTENT_BYTES / 1024 / 1024} MB limit` },
+          { status: 413 },
+        )
+      }
+
+      // EX-2: strict path sanitization — strip any .. segment and leading slashes
+      // regardless of slash direction or encoding
+      const normalised = String(path)
+        .replace(/\\/g, '/')           // normalise backslashes
+        .replace(/^\/+/, '')           // strip leading slashes
+        .split('/')
+        .filter(segment => segment !== '..' && segment !== '.' && segment !== '')
+        .join('/')
+      if (!normalised) continue        // skip empty paths after sanitisation
+      zip.file(`reminisce/${normalised}`, contentStr)
     }
 
     const zipBuffer = await zip.generateAsync({ type: 'uint8array' })
@@ -50,7 +88,7 @@ export async function POST(req: Request) {
       },
     })
   } catch (error: unknown) {
-    const msg = error instanceof Error ? error.message : String(error)
-    return NextResponse.json({ error: msg }, { status: 500 })
+    console.error('[export] error:', error)
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }
 }

@@ -51,15 +51,30 @@ export async function POST(req: Request) {
       return NextResponse.json({ ok: true, cancelled: true, method: 'manual' })
     }
 
-    // Cancel at period end — user keeps Pro until billing cycle ends
     const stripe = getStripe()
+
+    // ST-5: Retrieve the live subscription to check if cancel_at_period_end is
+    // already true. A second click (page refresh, or after a Stripe portal
+    // change) would otherwise make a redundant API call and re-write the DB.
+    const liveSub = await stripe.subscriptions.retrieve(plan.stripe_subscription_id)
+
+    if (liveSub.cancel_at_period_end) {
+      // Already scheduled for cancellation — nothing to do.
+      return NextResponse.json({ ok: true, cancelled: true, method: 'stripe', already_cancelling: true })
+    }
+
+    // Cancel at period end — user keeps Pro until billing cycle ends.
     await stripe.subscriptions.update(plan.stripe_subscription_id, {
       cancel_at_period_end: true,
     })
 
-    // Mark status as cancelled in our DB, keep plan as 'pro'
+    // ST-12: Use 'cancelling' rather than 'cancelled' to distinguish "will be
+    // cancelled at period end" (user still has Pro access) from "actually
+    // cancelled" (set by customer.subscription.deleted webhook). Any Pro-feature
+    // gate must check plan === 'pro', not status === 'active', so current
+    // behaviour is safe — but the status string is now semantically accurate.
     await sb.from('user_plans').update({
-      status: 'cancelled',
+      status: 'cancelling',
       updated_at: new Date().toISOString(),
     }).eq('user_id', user.id)
 
@@ -68,7 +83,7 @@ export async function POST(req: Request) {
     })
 
   } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err)
-    return NextResponse.json({ error: msg }, { status: 500 })
+    console.error('[stripe/cancel] error:', err)
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }
 }

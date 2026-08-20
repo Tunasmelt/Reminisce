@@ -1,8 +1,9 @@
 import { NextResponse } from 'next/server'
 import Stripe from 'stripe'
-import { 
+import {
   supabase as clientSupabase,
-  getServiceSupabase 
+  getServiceSupabase,
+  isUserBanned,
 } from '@/lib/supabase'
 
 export const dynamic = 'force-dynamic'
@@ -52,10 +53,49 @@ export async function POST(req: Request) {
       )
     }
 
-    const { type, packId } = await req.json()
+    // ST-13: Banned users must not be able to purchase Pro or gems.
+    if (await isUserBanned(user.id))
+      return NextResponse.json({ error: 'Account suspended' }, { status: 403 })
+
+    // ST-14: Guard JSON parse so a malformed request body returns 400 not 500.
+    let body: { type?: string; packId?: string }
+    try {
+      body = await req.json()
+    } catch {
+      return NextResponse.json({ error: 'Invalid JSON body' }, { status: 400 })
+    }
+    const { type, packId } = body
+
+    // ST-15: Whitelist the type field early — reject anything that isn't a
+    // recognised checkout kind before making any Stripe API calls, so unknown
+    // values don't slip through to the later if/else and return a 200 with
+    // an "Invalid type" body that is easy for callers to miss.
+    const ALLOWED_TYPES = new Set(['subscription', 'gems'])
+    if (!type || !ALLOWED_TYPES.has(type)) {
+      return NextResponse.json(
+        { error: `Invalid type "${type ?? ''}". Must be one of: ${Array.from(ALLOWED_TYPES).join(', ')}` },
+        { status: 400 },
+      )
+    }
+
     const supabase = getServiceSupabase()
 
-    // Get or create Stripe customer
+    // ST-8: Validate required env var before attempting any Stripe call so the
+    // error is immediately actionable rather than a cryptic Stripe API 400.
+    if (type === 'subscription' && !process.env.STRIPE_PRO_PRICE_ID) {
+      console.error('[stripe/checkout] STRIPE_PRO_PRICE_ID is not configured')
+      return NextResponse.json(
+        { error: 'Subscription unavailable — contact support.' },
+        { status: 503 },
+      )
+    }
+
+    // Get or create Stripe customer.
+    // ST-4: Guard against duplicate customer creation from two concurrent
+    // checkout requests (e.g. subscription + gem pack opened in two tabs).
+    // Both requests may read stripe_customer_id = null simultaneously, then
+    // both call stripe.customers.create, leaving an orphaned Stripe customer.
+    // Defence: search Stripe for an existing customer by email before creating.
     const { data: planData } = await supabase
       .from('user_plans')
       .select('stripe_customer_id')
@@ -65,15 +105,41 @@ export async function POST(req: Request) {
     let customerId = planData?.stripe_customer_id
 
     if (!customerId) {
-      const customer = await stripe.customers.create({
-        email: user.email || undefined,
-        metadata: { supabase_user_id: user.id },
-      })
-      customerId = customer.id
+      // Check for an existing Stripe customer with this email before creating.
+      const email = user.email
+      let existingCustomerId: string | null = null
+
+      if (email) {
+        const existing = await stripe.customers.list({ email, limit: 1 })
+        if (existing.data.length > 0) {
+          existingCustomerId = existing.data[0].id
+        }
+      }
+
+      if (existingCustomerId) {
+        customerId = existingCustomerId
+      } else {
+        const customer = await stripe.customers.create({
+          email: email || undefined,
+          metadata: { supabase_user_id: user.id },
+        })
+        customerId = customer.id
+      }
+
+      // Write back — use a conditional update so a concurrent request that
+      // already wrote a customer ID wins and we don't overwrite it.
       await supabase
         .from('user_plans')
         .update({ stripe_customer_id: customerId })
         .eq('user_id', user.id)
+        .is('stripe_customer_id', null)
+    }
+
+    // Narrow customerId to a definite string before handing it to Stripe.
+    // (planData?.stripe_customer_id is string | undefined.)
+    if (!customerId) {
+      console.error('[stripe/checkout] Failed to resolve a Stripe customer id')
+      return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
     }
 
     if (type === 'subscription') {
@@ -103,6 +169,12 @@ export async function POST(req: Request) {
       return NextResponse.json({ url: session.url })
 
     } else if (type === 'gems') {
+      if (!packId) {
+        return NextResponse.json(
+          { error: 'Missing packId' },
+          { status: 400 }
+        )
+      }
       const pack = GEM_PACKS[packId]
       if (!pack) {
         return NextResponse.json(
@@ -143,11 +215,10 @@ export async function POST(req: Request) {
       { status: 400 }
     )
 
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  } catch (err: any) {
-    console.error('Stripe checkout error:', err)
+  } catch (err: unknown) {
+    console.error('[stripe/checkout] error:', err)
     return NextResponse.json(
-      { error: err.message },
+      { error: 'Internal server error' },
       { status: 500 }
     )
   }

@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { supabase as clientSupabase } from '@/lib/supabase'
+import { supabase as clientSupabase, isUserBanned } from '@/lib/supabase'
 import { awardCoins } from '@/lib/wallet'
 
 export const dynamic = 'force-dynamic'
@@ -17,6 +17,10 @@ export async function POST(req: NextRequest) {
     if (error || !user) {
       return NextResponse.json({ error: 'Invalid token' }, { status: 401 })
     }
+
+    // R-3: banned users must not receive daily coin rewards
+    if (await isUserBanned(user.id))
+      return NextResponse.json({ error: 'Account suspended' }, { status: 403 })
 
     const result = await awardCoins(user.id, 'daily_login')
 
