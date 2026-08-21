@@ -103,31 +103,36 @@ export default function EngineeringPage() {
   ]
 
   const models = [
-    { provider:'Anthropic', name:'Claude Sonnet 4.6', use:'Architecture, complex reasoning, long context', tier:'Pro'  },
-    { provider:'Anthropic', name:'Claude Haiku 4.5',  use:'Fast responses, light tasks',                  tier:'Pro'  },
-    { provider:'OpenAI',    name:'GPT-4o',            use:'General coding, multimodal',                   tier:'Pro'  },
-    { provider:'Google',    name:'Gemini 2.5 Pro',    use:'Long context, data analysis',                  tier:'Pro'  },
-    { provider:'Mistral',   name:'Mistral Large',     use:'Code generation, long documents',              tier:'Pro'  },
-    { provider:'Mistral',   name:'Codestral',         use:'Code-specific generation',                     tier:'Pro'  },
-    { provider:'Groq',      name:'Llama 3.3 70B',    use:'General tasks — fast, no cost',                tier:'Free' },
-    { provider:'Groq',      name:'Llama 4 Scout',    use:'Capable generalist, no cost',                  tier:'Free' },
-    { provider:'Groq',      name:'Kimi K2',          use:'Long context reasoning, no cost',              tier:'Free' },
-    { provider:'Groq',      name:'Qwen3 32B',        use:'Multilingual reasoning, no cost',              tier:'Free' },
-    { provider:'Cerebras',  name:'Llama 3.3 70B',    use:'Ultra-fast inference, no cost',                tier:'Free' },
-    { provider:'SambaNova', name:'Llama 405B',       use:'Large model quality, no cost',                 tier:'Free' },
-    { provider:'Mistral',   name:'Mistral Small',    use:'Lightweight, no cost',                         tier:'Free' },
+    { provider:'Anthropic', name:'Claude Sonnet 4',      use:'Architecture, complex reasoning, long context', tier:'Pro'  },
+    { provider:'Anthropic', name:'Claude Haiku 4.5',     use:'Fast responses, light tasks',                  tier:'Pro'  },
+    { provider:'OpenAI',    name:'GPT-4o',               use:'General coding, multimodal',                   tier:'Pro'  },
+    { provider:'OpenAI',    name:'GPT-4o Mini',          use:'Fast, economical general tasks',               tier:'Pro'  },
+    { provider:'Google',    name:'Gemini 2.5 Pro',       use:'Long context, data analysis',                  tier:'Pro'  },
+    { provider:'Google',    name:'Gemini 2.5 Flash',     use:'Fast multimodal, balanced',                    tier:'Pro'  },
+    { provider:'Mistral',   name:'Mistral Large',        use:'Code generation, long documents',              tier:'Pro'  },
+    { provider:'Mistral',   name:'Codestral',            use:'Code-specific generation',                     tier:'Pro'  },
+    { provider:'Groq',      name:'Llama 3.3 70B',        use:'General tasks — fast, no cost',               tier:'Free' },
+    { provider:'Groq',      name:'Llama 3.1 8B Instant', use:'Ultra-fast lightweight tasks',                 tier:'Free' },
+    { provider:'Groq',      name:'Gemma 2 9B',           use:'Efficient generalist, no cost',                tier:'Free' },
+    { provider:'Groq',      name:'Mixtral 8x7B',         use:'Multilingual, long context, no cost',          tier:'Free' },
+    { provider:'Cerebras',  name:'Llama 3.3 70B',        use:'Ultra-fast inference, no cost',                tier:'Free' },
+    { provider:'Cerebras',  name:'Llama 3.1 8B',         use:'Fastest small model, no cost',                 tier:'Free' },
+    { provider:'Mistral',   name:'Mistral Small',        use:'Lightweight free tasks',                       tier:'Free' },
+    { provider:'Google',    name:'Gemini 2.0 Flash',     use:'Free multimodal, fast',                        tier:'Free' },
+    { provider:'OpenRouter', name:'DeepSeek Chat',       use:'DeepSeek v3, free tier',                       tier:'Free' },
+    { provider:'OpenRouter', name:'Qwen 2.5 72B',        use:'Multilingual reasoning, free tier',            tier:'Free' },
   ]
 
   return (
     <div style={{ background:'#05050f', color:'#fff', minHeight:'100vh', overflowX:'hidden' }}>
-      <style>{`
+      <style suppressHydrationWarning dangerouslySetInnerHTML={{ __html: `
         .sr{opacity:0;transform:translateY(28px);transition:opacity .8s ease,transform .8s ease}
         .sr-vis{opacity:1;transform:translateY(0)}
         .d1{transition-delay:.06s}.d2{transition-delay:.14s}.d3{transition-delay:.22s}
         @keyframes ring-float{0%,100%{transform:translateY(0)}50%{transform:translateY(-10px)}}
         .model-row{transition:background .15s}
         .model-row:hover{background:rgba(255,255,255,0.04)!important}
-      `}</style>
+      ` }} />
 
       <div style={{ position:'fixed', top:-200, left:'50%', transform:'translateX(-50%)', width:800, height:500, background:`radial-gradient(ellipse,${hexToRgba(ac,0.12)} 0%,transparent 70%)`, pointerEvents:'none', zIndex:0 }}/>
 

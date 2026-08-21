@@ -159,11 +159,11 @@ export default function DocsPage() {
     <div style={{
       background: '#05050f', color: '#fff', minHeight: '100vh',
     }}>
-      <style>{`
+      <style suppressHydrationWarning dangerouslySetInnerHTML={{ __html: `
         @keyframes ring-float{
           0%,100%{transform:translateY(0)}50%{transform:translateY(-6px)}
         }
-      `}</style>
+      ` }} />
 
       {/* Fixed top glow */}
       <div style={{

@@ -130,13 +130,13 @@ export default function UpgradePage() {
 
   return (
     <div style={{ background:'#05050f', color:'#fff', minHeight:'100vh', overflowX:'hidden' }}>
-      <style>{`
+      <style suppressHydrationWarning dangerouslySetInnerHTML={{ __html: `
         .sr{opacity:0;transform:translateY(28px);transition:opacity .8s ease,transform .8s ease}
         .sr-vis{opacity:1;transform:translateY(0)}
         .d1{transition-delay:.06s}.d2{transition-delay:.14s}.d3{transition-delay:.22s}
         @keyframes gem-float{0%,100%{transform:translateY(0) rotate(0deg)}50%{transform:translateY(-8px) rotate(3deg)}}
         @keyframes crystal-spin{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}
-      `}</style>
+      ` }} />
 
       <div style={{ position:'fixed', top:-200, left:'50%', transform:'translateX(-50%)', width:800, height:500, background:`radial-gradient(ellipse,${hexToRgba(ac,0.12)} 0%,transparent 70%)`, pointerEvents:'none', zIndex:0 }}/>
 
