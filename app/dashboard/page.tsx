@@ -2,7 +2,7 @@
 
 import { useEffect, useState, useCallback } from 'react'
 import { supabase } from '@/lib/supabase'
-import { Rocket, Plus, FolderOpen, CheckCircle2 } from 'lucide-react'
+import { Rocket, Plus, FolderOpen, CheckCircle2, FolderInput } from 'lucide-react'
 import { saveHandle } from '@/lib/fsapi'
 import {
   Dialog,
@@ -20,6 +20,8 @@ import { useRouter } from 'next/navigation'
 import { useTheme } from '@/hooks/useTheme'
 import CustomSelect from '@/components/CustomSelect'
 
+import { Project } from '@/types/project'
+
 interface ProjectStats {
   id: string
   phasesCount: number
@@ -32,16 +34,6 @@ interface Workspace {
   name: string
 }
 
-interface Project {
-  id: string
-  name: string
-  description: string | null
-  tech_stack: string[] | null
-  workspace_id: string
-  workspaces: {
-    name: string
-  }
-}
 
 function hexToRgba(hex: string, a: number) {
   const r = parseInt(hex.slice(1, 3), 16)
@@ -72,6 +64,12 @@ export default function DashboardPage() {
   } | null>(null)
   const [isDeleting, setIsDeleting] = useState(false)
 
+  const [confirmDeleteProject, setConfirmDeleteProject] = useState<{
+    id: string
+    name: string
+  } | null>(null)
+  const [isDeletingProject, setIsDeletingProject] = useState(false)
+
   const [projWS, setProjWS] = useState('')
   const [projName, setProjName] = useState('')
   const [projDesc, setProjDesc] = useState('')
@@ -98,25 +96,45 @@ export default function DashboardPage() {
     setLoading(true)
 
     try {
+      const { data: { session: authSession } } = await supabase.auth.getSession()
+      const authHeader = { 'Authorization': `Bearer ${authSession?.access_token}` }
+
       const { data: wsData } = await supabase.from('workspaces').select('*').order('created_at', { ascending: false })
       setWorkspaces(wsData || [])
 
-      if (wsData && wsData.length > 0) {
-        if (!projWS) setProjWS(wsData[0].id)
-        const { data: projData } = await supabase.from('projects').select(`*, workspaces(name)`).order('created_at', { ascending: false })
-        setProjects(projData as unknown as Project[])
+      if (wsData && wsData.length > 0 && !projWS) {
+        setProjWS(wsData[0].id)
+      }
 
-        const stats: Record<string, ProjectStats> = {}
-        for (const proj of (projData as unknown as Project[])) {
+      // ── Always run repair so project_members rows exist for the project detail ──
+      // page (which uses client-side Supabase + RLS). The repair is idempotent and
+      // returns in <50ms when nothing needs fixing.
+      fetch('/api/projects/repair', { method: 'POST', headers: authHeader }).catch(() => {})
+
+      // ── Fetch projects via API (service role) to bypass RLS ghost-project bug ──
+      const projRes = await fetch('/api/projects', { headers: authHeader })
+      let projectsList: Project[] = []
+      if (projRes.ok) {
+        const { projects: apiProjects } = await projRes.json()
+        projectsList = (apiProjects as Project[]) ?? []
+      }
+
+      setProjects(projectsList)
+
+      // Fetch per-project stats fully in parallel across all projects
+      // (previously a serial loop → N sequential round-trips gating render).
+      const stats: Record<string, ProjectStats> = {}
+      await Promise.all(
+        projectsList.map(async proj => {
           const [{ count: pCount }, { count: fCount }, { data: lastRun }] = await Promise.all([
             supabase.from('phases').select('*', { count: 'exact', head: true }).eq('project_id', proj.id),
             supabase.from('features').select('*', { count: 'exact', head: true }).eq('project_id', proj.id),
             supabase.from('agent_runs').select('created_at').eq('project_id', proj.id).order('created_at', { ascending: false }).limit(1).maybeSingle()
           ])
           stats[proj.id] = { id: proj.id, phasesCount: pCount || 0, featuresCount: fCount || 0, lastRun: (lastRun as { created_at: string } | null)?.created_at || null }
-        }
-        setProjectStats(stats)
-      }
+        })
+      )
+      setProjectStats(stats)
 
       const { data: planData } = await supabase
         .from('user_plans')
@@ -155,19 +173,19 @@ export default function DashboardPage() {
       }
 
       if (gemsPurchased) {
-        toast.success(
-          `💎 ${gemsPurchased} gems added to your wallet!`,
-          { duration: 6000 }
-        )
-        window.history.replaceState({}, '', '/dashboard')
-        setWallet(prev => prev
-          ? {
-            ...prev,
-            gems: (prev.gems || 0) +
-              parseInt(gemsPurchased)
-          }
-          : prev
-        )
+        // Query param is untrusted — guard against NaN poisoning the balance.
+        const purchased = parseInt(gemsPurchased, 10)
+        if (Number.isFinite(purchased) && purchased > 0) {
+          toast.success(
+            `💎 ${purchased} gems added to your wallet!`,
+            { duration: 6000 }
+          )
+          window.history.replaceState({}, '', '/dashboard')
+          setWallet(prev => prev
+            ? { ...prev, gems: (prev.gems || 0) + purchased }
+            : prev
+          )
+        }
       }
     } catch { toast.error('Query failure') }
     finally { setLoading(false) }
@@ -220,6 +238,30 @@ export default function DashboardPage() {
     setConfirmDelete(null)
     if (error) toast.error(error.message)
     else { toast.success(`Group "${confirmDelete.name}" deleted`); fetchData() }
+  }
+
+  const handleConfirmDeleteProject = async () => {
+    if (!confirmDeleteProject) return
+    setIsDeletingProject(true)
+    try {
+      const { data: { session: authSession } } = await supabase.auth.getSession()
+      const res = await fetch(`/api/projects/${confirmDeleteProject.id}`, {
+        method: 'DELETE',
+        headers: { 'Authorization': `Bearer ${authSession?.access_token}` }
+      })
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}))
+        toast.error(body?.error || 'Failed to delete project')
+        return
+      }
+      toast.success(`"${confirmDeleteProject.name}" deleted`)
+      setConfirmDeleteProject(null)
+      fetchData()
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Failed to delete project')
+    } finally {
+      setIsDeletingProject(false)
+    }
   }
 
   const handlePickFolderInModal = async () => {
@@ -393,53 +435,55 @@ export default function DashboardPage() {
                 const atLimit = userPlan
                   && projects.length >= userPlan.projects_limit
                 return (
-                  <button
-                    onClick={() => {
-                      if (atLimit) {
-                        toast.error(
-                          `Free tier allows ${userPlan?.projects_limit ?? 2} projects. Upgrade to Pro for unlimited.`,
-                          { duration: 5000 }
-                        )
-                        return
+                  <>
+                    <button
+                      onClick={() => {
+                        if (atLimit) {
+                          toast.error(
+                            `Free tier allows ${userPlan?.projects_limit ?? 2} projects. Upgrade to Pro for unlimited.`,
+                            { duration: 5000 }
+                          )
+                          return
+                        }
+                        setIsProjectOpen(true)
+                      }}
+                      disabled={workspaces.length === 0}
+                      style={{
+                        display: 'flex',
+                        alignItems: 'center', gap: 8,
+                        padding: '12px 24px',
+                        background: atLimit
+                          ? 'rgba(255,255,255,0.08)'
+                          : accent,
+                        color: atLimit ? 'rgba(255,255,255,0.4)' : '#000',
+                        border: atLimit
+                          ? '1px solid rgba(255,255,255,0.1)'
+                          : '1px solid rgba(255,255,255,0.15)',
+                        borderRadius: 999,
+                        fontSize: 12, fontWeight: 700,
+                        cursor: 'pointer',
+                        transition: 'all 0.2s',
+                        width: isMobile ? '100%' : 'auto'
+                      }}
+                      onMouseEnter={(e) => {
+                        if (!atLimit) {
+                          e.currentTarget.style.opacity = '0.88'
+                          e.currentTarget.style.transform = 'scale(1.02)'
+                        }
+                      }}
+                      onMouseLeave={(e) => {
+                        if (!atLimit) {
+                          e.currentTarget.style.opacity = '1'
+                          e.currentTarget.style.transform = 'scale(1)'
+                        }
+                      }}
+                    >
+                      {atLimit
+                        ? `⚡ Upgrade for more projects`
+                        : <><Rocket size={14} /> New project</>
                       }
-                      setIsProjectOpen(true)
-                    }}
-                    disabled={workspaces.length === 0}
-                    style={{
-                      display: 'flex',
-                      alignItems: 'center', gap: 8,
-                      padding: '12px 24px',
-                      background: atLimit
-                        ? 'rgba(255,255,255,0.08)'
-                        : accent,
-                      color: atLimit ? 'rgba(255,255,255,0.4)' : '#000',
-                      border: atLimit
-                        ? '1px solid rgba(255,255,255,0.1)'
-                        : '1px solid rgba(255,255,255,0.15)',
-                      borderRadius: 999,
-                      fontSize: 12, fontWeight: 700,
-                      cursor: 'pointer',
-                      transition: 'all 0.2s',
-                      width: isMobile ? '100%' : 'auto'
-                    }}
-                    onMouseEnter={(e) => {
-                      if (!atLimit) {
-                        e.currentTarget.style.opacity = '0.88'
-                        e.currentTarget.style.transform = 'scale(1.02)'
-                      }
-                    }}
-                    onMouseLeave={(e) => {
-                      if (!atLimit) {
-                        e.currentTarget.style.opacity = '1'
-                        e.currentTarget.style.transform = 'scale(1)'
-                      }
-                    }}
-                  >
-                    {atLimit
-                      ? `⚡ Upgrade for more projects`
-                      : <><Rocket size={14} /> New project</>
-                    }
-                  </button>
+                    </button>
+                  </>
                 )
               })()}
             </div>
@@ -696,6 +740,38 @@ export default function DashboardPage() {
                   e.currentTarget.style.boxShadow = 'none'
                 }}
               >
+                {/* Delete button — top-right corner */}
+                <button
+                  onClick={e => {
+                    e.stopPropagation()
+                    setConfirmDeleteProject({ id: p.id, name: p.name })
+                  }}
+                  title="Delete project"
+                  style={{
+                    position: 'absolute', top: 12, right: 12,
+                    width: 26, height: 26,
+                    display: 'flex', alignItems: 'center', justifyContent: 'center',
+                    background: 'transparent',
+                    border: 'none',
+                    borderRadius: 6,
+                    color: 'rgba(255,255,255,0.2)',
+                    fontSize: 16,
+                    cursor: 'pointer',
+                    transition: 'color 0.15s, background 0.15s',
+                    zIndex: 2,
+                  }}
+                  onMouseEnter={e => {
+                    e.currentTarget.style.color = '#ef4444'
+                    e.currentTarget.style.background = 'rgba(239,68,68,0.1)'
+                  }}
+                  onMouseLeave={e => {
+                    e.currentTarget.style.color = 'rgba(255,255,255,0.2)'
+                    e.currentTarget.style.background = 'transparent'
+                  }}
+                >
+                  ×
+                </button>
+
                 {/* Top row: workspace badge + active dot */}
                 <div style={{
                   display: 'flex',
@@ -703,18 +779,57 @@ export default function DashboardPage() {
                   alignItems: 'center',
                   marginBottom: 14,
                 }}>
-                  <span style={{
-                    fontSize: 9, fontWeight: 700,
-                    padding: '3px 8px',
-                    borderRadius: 999,
-                    background: hexToRgba(accent, 0.1),
-                    border: `1px solid ${hexToRgba(accent, 0.2)}`,
-                    color: accent,
-                    letterSpacing: '0.06em',
-                    textTransform: 'uppercase',
-                  }}>
-                    {p.workspaces?.name || 'General'}
-                  </span>
+                  <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                    <span style={{
+                      fontSize: 9, fontWeight: 700,
+                      padding: '3px 8px',
+                      borderRadius: 999,
+                      background: hexToRgba(accent, 0.1),
+                      border: `1px solid ${hexToRgba(accent, 0.2)}`,
+                      color: accent,
+                      letterSpacing: '0.06em',
+                      textTransform: 'uppercase',
+                    }}>
+                      {p.workspaces?.name || 'General'}
+                    </span>
+                    {/* "New" badge: show for projects created within the last 7 days */}
+                    {p.created_at && (Date.now() - new Date(p.created_at).getTime()) < 7 * 24 * 60 * 60 * 1000 && (
+                      <span style={{
+                        fontSize: 9, fontWeight: 800, padding: '2px 8px',
+                        borderRadius: 999, letterSpacing: '0.06em',
+                        background: 'rgba(16,185,129,0.1)',
+                        border: '1px solid rgba(16,185,129,0.25)',
+                        color: '#34d399',
+                      }}>
+                        NEW
+                      </span>
+                    )}
+                    {/* "Imported" badge */}
+                    {p.created_via === 'import' && (
+                      <div style={{ display: 'flex', gap: 4 }}>
+                        <span style={{
+                          fontSize: 9, fontWeight: 800, padding: '2px 8px',
+                          borderRadius: 999, letterSpacing: '0.06em',
+                          background: 'rgba(99,102,241,0.1)',
+                          border: '1px solid rgba(99,102,241,0.25)',
+                          color: '#818cf8',
+                        }}>
+                          IMPORTED
+                        </span>
+                        {p.scan_source && (
+                          <span style={{
+                            fontSize: 9, fontWeight: 800, padding: '2px 8px',
+                            borderRadius: 999, letterSpacing: '0.06em',
+                            background: 'rgba(255,255,255,0.05)',
+                            border: '1px solid rgba(255,255,255,0.12)',
+                            color: 'rgba(255,255,255,0.4)',
+                          }}>
+                            {p.scan_source.toUpperCase()}
+                          </span>
+                        )}
+                      </div>
+                    )}
+                  </div>
                   <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 3 }}>
                     <span style={{
                       display: 'flex', alignItems: 'center',
@@ -855,11 +970,12 @@ export default function DashboardPage() {
                   </div>
                 )}
 
-                {/* Open button */}
+                {/* Action buttons row */}
                 <div style={{
                   display: 'flex',
                   justifyContent: 'flex-end',
                   alignItems: 'center',
+                  gap: 8,
                 }}>
                   <button
                     onClick={e => {
@@ -919,6 +1035,38 @@ export default function DashboardPage() {
             <Plus size={32} style={{ color: 'rgba(255,255,255,0.15)' }} />
             <div style={{ fontSize: 12, fontWeight: 500, color: 'rgba(255,255,255,0.25)' }}>
               New project
+            </div>
+          </div>
+
+          {/* Import existing project card */}
+          <div
+            onClick={() => router.push('/dashboard/import')}
+            style={{
+              border: '1px dashed rgba(99,102,241,0.2)',
+              borderRadius: 20,
+              background: 'rgba(99,102,241,0.02)',
+              display: 'flex', flexDirection: 'column' as const,
+              alignItems: 'center', justifyContent: 'center',
+              gap: 10, minHeight: 220,
+              cursor: 'pointer', transition: 'all 0.2s',
+            }}
+            onMouseEnter={(e) => {
+              e.currentTarget.style.borderColor = 'rgba(99,102,241,0.45)'
+              e.currentTarget.style.background = 'rgba(99,102,241,0.06)'
+            }}
+            onMouseLeave={(e) => {
+              e.currentTarget.style.borderColor = 'rgba(99,102,241,0.2)'
+              e.currentTarget.style.background = 'rgba(99,102,241,0.02)'
+            }}
+          >
+            <FolderInput size={32} style={{ color: 'rgba(99,102,241,0.45)' }} />
+            <div style={{ textAlign: 'center' as const }}>
+              <div style={{ fontSize: 12, fontWeight: 600, color: 'rgba(99,102,241,0.7)' }}>
+                Import existing
+              </div>
+              <div style={{ fontSize: 10, color: 'rgba(255,255,255,0.2)', marginTop: 4 }}>
+                Local folder or GitHub URL
+              </div>
             </div>
           </div>
         </div>      {(
@@ -1262,6 +1410,82 @@ export default function DashboardPage() {
               }}
             >
               {isDeleting ? 'Deleting...' : 'Delete group'}
+            </button>
+          </div>
+        </div>
+      </div>
+    )}
+
+    {/* Project delete confirmation overlay */}
+    {confirmDeleteProject && (
+      <div
+        style={{
+          position: 'fixed', inset: 0, zIndex: 9999,
+          background: 'rgba(0,0,0,0.7)',
+          backdropFilter: 'blur(8px)',
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+        }}
+        onClick={() => !isDeletingProject && setConfirmDeleteProject(null)}
+      >
+        <div
+          style={{
+            background: 'rgba(12,12,20,0.97)',
+            border: '1px solid rgba(255,255,255,0.1)',
+            borderRadius: 20,
+            padding: '32px',
+            maxWidth: 420,
+            width: '90%',
+          }}
+          onClick={e => e.stopPropagation()}
+        >
+          <div style={{
+            fontSize: 9, fontWeight: 800,
+            letterSpacing: '0.18em',
+            textTransform: 'uppercase' as const,
+            color: '#ef4444',
+            marginBottom: 12,
+          }}>
+            Delete Project
+          </div>
+          <div style={{
+            fontSize: 13, color: 'rgba(255,255,255,0.5)',
+            lineHeight: 1.6, marginBottom: 24,
+          }}>
+            Are you sure you want to delete{' '}
+            <span style={{ color: '#fff', fontWeight: 700 }}>
+              &quot;{confirmDeleteProject.name}&quot;
+            </span>
+            ? All phases, features, and agent runs will be permanently removed.
+          </div>
+          <div style={{ display: 'flex', gap: 12, justifyContent: 'flex-end' }}>
+            <button
+              onClick={() => setConfirmDeleteProject(null)}
+              disabled={isDeletingProject}
+              style={{
+                padding: '9px 20px',
+                background: 'rgba(255,255,255,0.06)',
+                border: '1px solid rgba(255,255,255,0.12)',
+                borderRadius: 10, cursor: 'pointer',
+                fontSize: 13, fontWeight: 600,
+                color: 'rgba(255,255,255,0.6)',
+              }}
+            >
+              Cancel
+            </button>
+            <button
+              onClick={handleConfirmDeleteProject}
+              disabled={isDeletingProject}
+              style={{
+                padding: '9px 20px',
+                background: '#ef4444',
+                border: 'none',
+                borderRadius: 10, cursor: 'pointer',
+                fontSize: 13, fontWeight: 700,
+                color: '#fff',
+                opacity: isDeletingProject ? 0.6 : 1,
+              }}
+            >
+              {isDeletingProject ? 'Deleting...' : 'Delete project'}
             </button>
           </div>
         </div>

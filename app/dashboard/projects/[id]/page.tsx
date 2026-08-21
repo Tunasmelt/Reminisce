@@ -11,17 +11,7 @@ import ExportBriefModal from '@/components/ExportBriefModal'
 import { useFileSystem } from '@/hooks/useFileSystem'
 import { useIsMobile } from '@/hooks/useMediaQuery'
 
-interface Project {
-  id:             string
-  name:           string
-  description:    string | null
-  type?:          string
-  cluster?:       string
-  created_at?:    string
-  repo_url?:      string | null
-  git_branch?:    string | null
-  git_last_commit?: string | null
-}
+import { Project } from '@/types/project'
 
 interface Phase {
   id: string
@@ -114,33 +104,112 @@ export default function ProjectOverviewPage() {
     return localStorage.getItem(`blueprint_synced_${projectId}`) ?? null
   })
   const [hasBlueprint, setHasBlueprint] = useState(false)
+  const [members, setMembers] = useState<Array<{
+    id: string
+    user_id: string | null
+    email: string
+    role: 'head' | 'collaborator' | 'viewer'
+    invite_status: string
+  }>>([])
+  const [myRole, setMyRole] = useState<'head' | 'collaborator' | 'viewer' | null>(null)
+  const [showInviteModal, setShowInviteModal] = useState(false)
+  const [inviteEmail, setInviteEmail] = useState('')
+  const [inviteRole, setInviteRole] = useState<'collaborator' | 'viewer'>('collaborator')
+  const [inviting, setInviting] = useState(false)
+  const [currentUser, setCurrentUser] = useState<string | null>(null)
 
   const loadData = useCallback(async () => {
     try {
-      const [{ data: proj }, { data: pData }, { data: fData }, { data: ctxData }] = await Promise.all([
-        supabase.from('projects').select('*').eq('id', projectId).single(),
-        supabase.from('phases').select('*').eq('project_id', projectId).order('order_index', { ascending: true }),
-        supabase.from('features').select('*, phases(name)').eq('project_id', projectId).order('created_at', { ascending: false }),
-        supabase.from('context_versions').select('content').eq('project_id', projectId).order('created_at', { ascending: false }).limit(1).maybeSingle()
-      ])
-      if (!proj) throw new Error('Project not found')
+      const { data: { session } } = await supabase.auth.getSession()
+      if (!session) throw new Error('Not authenticated')
+
+      const authHeader = { Authorization: `Bearer ${session.access_token}` }
+      setCurrentUser(session.user.id)
+
+      // ── Primary fetch via API (service role, no RLS issues) ──────────────────
+      const projRes = await fetch(`/api/projects/${projectId}`, { headers: authHeader })
+      if (!projRes.ok) {
+        const body = await projRes.json().catch(() => ({}))
+        throw new Error(body.error || `Failed to load project (${projRes.status})`)
+      }
+      const { project: proj, phases: pData, features: fData, contextDoc: ctxContent, hasBlueprint: bp } = await projRes.json()
+
       setProject(proj as Project)
       setPhases(pData || [])
       setFeatures(fData || [])
-      setContextDoc(ctxData?.content || '')
+      setContextDoc(ctxContent || '')
+      setHasBlueprint(!!bp)
+
+      // ── Team members (non-fatal) ──────────────────────────────────────────────
       try {
-        const { count } = await supabase
-          .from('contexts')
-          .select('id', { count: 'exact', head: true })
-          .eq('project_id', projectId)
-        setHasBlueprint((count ?? 0) > 0)
+        const res = await fetch(`/api/team/members?projectId=${projectId}`, { headers: authHeader })
+        const d = await res.json()
+        if (d.members) {
+          setMembers(d.members)
+          const me = d.members.find((m: { user_id: string }) => m.user_id === session.user.id)
+          if (me) {
+            setMyRole(me.role)
+          } else {
+            // Workspace owner fallback for pre-migration projects
+            const ws = proj.workspaces as { owner_id: string } | null
+            setMyRole(ws?.owner_id === session.user.id ? 'head' : null)
+          }
+        }
       } catch { /* non-fatal */ }
+
     } catch (err) {
       console.error(err)
-      toast.error('Query failure')
+      toast.error(err instanceof Error ? err.message : 'Query failure')
       router.push('/dashboard')
     } finally { setLoading(false) }
   }, [projectId, router])
+
+  const handleInvite = async () => {
+    if (!inviteEmail.trim() || inviting) return
+    setInviting(true)
+    try {
+      const { data: { session } } = await supabase.auth.getSession()
+      const res = await fetch('/api/team/invite', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${session?.access_token}`,
+        },
+        body: JSON.stringify({ projectId, email: inviteEmail.trim(), role: inviteRole }),
+      })
+      const d = await res.json()
+      if (d.ok) {
+        toast.success(d.status === 'pending'
+          ? `Invite sent to ${inviteEmail} — they need to sign up with this email`
+          : `${inviteEmail} added to project`)
+        setInviteEmail('')
+        setShowInviteModal(false)
+        loadData()
+      } else {
+        toast.error(d.error || 'Invite failed')
+      }
+    } catch {
+      toast.error('Invite failed')
+    }
+    setInviting(false)
+  }
+
+  const handleRemoveMember = async (userId: string) => {
+    const { data: { session } } = await supabase.auth.getSession()
+    const res = await fetch(`/api/team/members?projectId=${projectId}&userId=${userId}`, {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${session?.access_token}` },
+    })
+    const d = await res.json()
+    if (d.ok) { toast.success('Member removed'); loadData() }
+    else toast.error(d.error || 'Remove failed')
+  }
+
+  const roleColor = (role: string) => {
+    if (role === 'head') return { color: accent, bg: hexToRgba(accent, 0.1), border: hexToRgba(accent, 0.25) }
+    if (role === 'collaborator') return { color: '#60a5fa', bg: 'rgba(96,165,250,0.1)', border: 'rgba(96,165,250,0.25)' }
+    return { color: 'rgba(255,255,255,0.4)', bg: 'rgba(255,255,255,0.05)', border: 'rgba(255,255,255,0.1)' }
+  }
 
   useEffect(() => { loadData() }, [loadData])
 
@@ -185,13 +254,41 @@ export default function ProjectOverviewPage() {
           </div>
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 16, flexWrap: 'wrap' }}>
             <div>
-              <h1 style={{
-                fontSize: 'clamp(28px,3.5vw,44px)', fontWeight: 900,
-                color: '#fff', letterSpacing: '-0.04em',
-                margin: '0 0 6px', lineHeight: 1,
-              }}>
-                {project.name}
-              </h1>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap', marginBottom: 6 }}>
+                <h1 style={{
+                  fontSize: 'clamp(28px,3.5vw,44px)', fontWeight: 900,
+                  color: '#fff', letterSpacing: '-0.04em',
+                  margin: 0, lineHeight: 1,
+                }}>
+                  {project.name}
+                </h1>
+                {project.created_via === 'import' && (
+                  <div style={{ display: 'flex', gap: 6 }}>
+                    <span style={{
+                      fontSize: 9, fontWeight: 800, padding: '3px 9px',
+                      borderRadius: 999, letterSpacing: '0.08em',
+                      background: 'rgba(99,102,241,0.1)',
+                      border: '1px solid rgba(99,102,241,0.25)',
+                      color: '#818cf8', textTransform: 'uppercase',
+                      flexShrink: 0,
+                    }}>
+                      Imported
+                    </span>
+                    {project.scan_source && (
+                      <span style={{
+                        fontSize: 9, fontWeight: 800, padding: '3px 9px',
+                        borderRadius: 999, letterSpacing: '0.08em',
+                        background: 'rgba(255,255,255,0.06)',
+                        border: '1px solid rgba(255,255,255,0.12)',
+                        color: 'rgba(255,255,255,0.4)', textTransform: 'uppercase',
+                        flexShrink: 0,
+                      }}>
+                        {project.scan_source}
+                      </span>
+                    )}
+                  </div>
+                )}
+              </div>
               <p style={{ fontSize: 13, color: 'rgba(255,255,255,0.35)', margin: 0, lineHeight: 1.5 }}>
                 {project.description || 'No description — edit in Settings'}
               </p>
@@ -514,10 +611,205 @@ export default function ProjectOverviewPage() {
           )}
         </section>
 
+        {/* ── Team ─────────────────────────────────────── */}
+        <section style={{ marginTop: 32 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 16, justifyContent: 'space-between' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+              <h2 style={{ fontSize: 13, fontWeight: 800, color: '#fff', letterSpacing: '0.04em', margin: 0, textTransform: 'uppercase' }}>
+                Team
+              </h2>
+              <span style={{
+                fontSize: 10, fontWeight: 700,
+                background: 'rgba(255,255,255,0.06)',
+                border: '1px solid rgba(255,255,255,0.09)',
+                color: 'rgba(255,255,255,0.5)',
+                borderRadius: 999, padding: '2px 9px',
+              }}>{members.filter(m => m.invite_status === 'accepted').length}/8</span>
+            </div>
+            {myRole === 'head' && members.filter(m => m.invite_status !== 'declined').length < 8 && (
+              <button
+                onClick={() => setShowInviteModal(true)}
+                style={{
+                  display: 'flex', alignItems: 'center', gap: 6,
+                  padding: '7px 14px', borderRadius: 10,
+                  background: hexToRgba(accent, 0.1),
+                  border: `1px solid ${hexToRgba(accent, 0.25)}`,
+                  color: accent, fontSize: 11, fontWeight: 700, cursor: 'pointer',
+                }}
+              >
+                + Invite member
+              </button>
+            )}
+          </div>
+
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+            {members.map(member => {
+              const rc = roleColor(member.role)
+              const isPending = member.invite_status === 'pending'
+              return (
+                <div key={member.id} style={{
+                  display: 'flex', alignItems: 'center', gap: 14,
+                  padding: '14px 18px',
+                  background: 'rgba(255,255,255,0.025)',
+                  border: '1px solid rgba(255,255,255,0.07)',
+                  borderRadius: 12,
+                  opacity: isPending ? 0.65 : 1,
+                }}>
+                  {/* Avatar */}
+                  <div style={{
+                    width: 34, height: 34, borderRadius: '50%',
+                    background: isPending ? 'rgba(255,255,255,0.06)' : hexToRgba(accent, 0.1),
+                    border: `1px solid ${isPending ? 'rgba(255,255,255,0.1)' : hexToRgba(accent, 0.2)}`,
+                    display: 'flex', alignItems: 'center', justifyContent: 'center',
+                    fontSize: 13, fontWeight: 700, color: isPending ? 'rgba(255,255,255,0.3)' : accent,
+                    flexShrink: 0,
+                  }}>
+                    {isPending ? '?' : (member.email?.[0]?.toUpperCase() || '?')}
+                  </div>
+                  {/* Info */}
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontSize: 13, fontWeight: 600, color: '#fff', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      {member.email || 'Unknown'}
+                      {member.user_id === currentUser && (
+                        <span style={{ fontSize: 10, color: 'rgba(255,255,255,0.3)', marginLeft: 8 }}>you</span>
+                      )}
+                    </div>
+                    {isPending && (
+                      <div style={{ fontSize: 11, color: 'rgba(255,255,255,0.3)' }}>Invite pending — awaiting sign-up</div>
+                    )}
+                  </div>
+                  {/* Role badge */}
+                  <span style={{
+                    fontSize: 9, fontWeight: 800, padding: '3px 9px',
+                    borderRadius: 999, textTransform: 'uppercase', letterSpacing: '0.08em',
+                    background: rc.bg, color: rc.color, border: `1px solid ${rc.border}`,
+                    flexShrink: 0,
+                  }}>
+                    {member.role}
+                  </span>
+                  {/* Remove (head only, not self) */}
+                  {myRole === 'head' && member.user_id !== currentUser && member.role !== 'head' && (
+                    <button
+                      onClick={() => member.user_id && handleRemoveMember(member.user_id)}
+                      style={{
+                        background: 'none', border: 'none', cursor: 'pointer',
+                        color: 'rgba(255,255,255,0.2)', fontSize: 16, padding: '0 4px',
+                        lineHeight: 1, flexShrink: 0,
+                        transition: 'color 0.15s',
+                      }}
+                      onMouseEnter={e => e.currentTarget.style.color = '#f87171'}
+                      onMouseLeave={e => e.currentTarget.style.color = 'rgba(255,255,255,0.2)'}
+                      title="Remove member"
+                    >
+                      ×
+                    </button>
+                  )}
+                </div>
+              )
+            })}
+          </div>
+        </section>
+
+        {/* ── Invite Modal ─────────────────────────────── */}
+        {showInviteModal && (
+          <div style={{
+            position: 'fixed', inset: 0,
+            background: 'rgba(0,0,0,0.75)', backdropFilter: 'blur(10px)',
+            zIndex: 9999, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 24,
+          }}>
+            <div style={{
+              background: 'rgba(10,10,24,0.98)',
+              border: '1px solid rgba(255,255,255,0.1)',
+              borderRadius: 20, padding: '32px',
+              maxWidth: 420, width: '100%',
+              boxShadow: '0 32px 80px rgba(0,0,0,0.6)',
+            }}>
+              <div style={{ fontSize: 17, fontWeight: 800, color: '#fff', marginBottom: 6 }}>Invite a team member</div>
+              <div style={{ fontSize: 13, color: 'rgba(255,255,255,0.4)', marginBottom: 24, lineHeight: 1.6 }}>
+                They must have or create a Reminisce account with this email address.
+              </div>
+
+              <div style={{ marginBottom: 16 }}>
+                <div style={{ fontSize: 11, fontWeight: 700, color: 'rgba(255,255,255,0.4)', marginBottom: 8, letterSpacing: '0.08em', textTransform: 'uppercase' }}>Email</div>
+                <input
+                  type="email"
+                  value={inviteEmail}
+                  onChange={e => setInviteEmail(e.target.value)}
+                  placeholder="colleague@example.com"
+                  onKeyDown={e => { if (e.key === 'Enter') handleInvite() }}
+                  style={{
+                    width: '100%', boxSizing: 'border-box',
+                    background: 'rgba(255,255,255,0.05)',
+                    border: '1px solid rgba(255,255,255,0.12)',
+                    borderRadius: 10, padding: '11px 14px',
+                    fontSize: 13, color: '#fff', outline: 'none',
+                  }}
+                  autoFocus
+                />
+              </div>
+
+              <div style={{ marginBottom: 24 }}>
+                <div style={{ fontSize: 11, fontWeight: 700, color: 'rgba(255,255,255,0.4)', marginBottom: 10, letterSpacing: '0.08em', textTransform: 'uppercase' }}>Role</div>
+                <div style={{ display: 'flex', gap: 8 }}>
+                  {(['collaborator', 'viewer'] as const).map(r => (
+                    <button
+                      key={r}
+                      onClick={() => setInviteRole(r)}
+                      style={{
+                        flex: 1, padding: '12px 16px', borderRadius: 10,
+                        background: inviteRole === r ? hexToRgba(accent, 0.12) : 'rgba(255,255,255,0.04)',
+                        border: `1px solid ${inviteRole === r ? hexToRgba(accent, 0.3) : 'rgba(255,255,255,0.09)'}`,
+                        color: inviteRole === r ? accent : 'rgba(255,255,255,0.5)',
+                        cursor: 'pointer', textAlign: 'left',
+                      }}
+                    >
+                      <div style={{ fontSize: 12, fontWeight: 700, marginBottom: 3 }}>
+                        {r.charAt(0).toUpperCase() + r.slice(1)}
+                      </div>
+                      <div style={{ fontSize: 10, opacity: 0.65, lineHeight: 1.4 }}>
+                        {r === 'collaborator'
+                          ? 'Can view and edit features, use PAM, view graph/board/prompts/API lab'
+                          : 'Read-only access to graph, board, prompts, and API lab'}
+                      </div>
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div style={{ display: 'flex', gap: 10 }}>
+                <button
+                  onClick={() => { setShowInviteModal(false); setInviteEmail('') }}
+                  style={{
+                    flex: 1, padding: '11px', background: 'rgba(255,255,255,0.05)',
+                    border: '1px solid rgba(255,255,255,0.1)',
+                    borderRadius: 10, fontSize: 13, fontWeight: 600,
+                    color: 'rgba(255,255,255,0.5)', cursor: 'pointer',
+                  }}
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={handleInvite}
+                  disabled={!inviteEmail.trim() || inviting}
+                  style={{
+                    flex: 2, padding: '11px',
+                    background: inviteEmail.trim() && !inviting ? accent : 'rgba(255,255,255,0.08)',
+                    border: 'none', borderRadius: 10, fontSize: 13, fontWeight: 800,
+                    color: inviteEmail.trim() && !inviting ? '#000' : 'rgba(255,255,255,0.25)',
+                    cursor: inviteEmail.trim() && !inviting ? 'pointer' : 'not-allowed',
+                  }}
+                >
+                  {inviting ? 'Inviting…' : 'Send invite'}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
         {showExport && project && (
           <ExportBriefModal
             data={{
-              project: { name: project.name, type: project.type, cluster: project.cluster, created_at: project.created_at },
+              project: { name: project.name, created_at: project.created_at },
               phases: phases.map(p => ({ id: p.id, name: p.name, description: p.description, order: p.order_index })),
               features: features.map(f => ({ id: f.id, name: f.name, description: f.description, phase_id: f.phase_id, status: f.status })),
               context: contextDoc || '',

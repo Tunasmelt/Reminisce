@@ -212,6 +212,15 @@ export function useProjectData(
       phaseId: string,
       updates: Partial<Pick<Phase, 'name' | 'description' | 'status'>>
     ): Promise<void> => {
+      // Optimistic update first, roll back on failure.
+      let snapshot: Phase[] = []
+      setPhases(prev => {
+        snapshot = prev
+        return prev.map(p =>
+          p.id === phaseId ? { ...p, ...updates } : p
+        )
+      })
+
       try {
         const { error } = await supabase
           .from('phases')
@@ -219,16 +228,10 @@ export function useProjectData(
           .eq('id', phaseId)
 
         if (error) throw error
-
-        // Optimistic update
-        setPhases(prev =>
-          prev.map(p =>
-            p.id === phaseId ? { ...p, ...updates } : p
-          )
-        )
       } catch (err) {
         console.error('[useProjectData] updatePhase error:', err)
         toast.error('Failed to update phase')
+        setPhases(snapshot) // rollback
       }
     },
     []
@@ -236,9 +239,20 @@ export function useProjectData(
 
   const deletePhase = useCallback(
     async (phaseId: string): Promise<void> => {
+      // Optimistic remove of the phase and its features (which cascade
+      // delete via DB foreign key). Restore both on failure.
+      let phaseSnapshot: Phase[] = []
+      let featureSnapshot: Feature[] = []
+      setPhases(prev => {
+        phaseSnapshot = prev
+        return prev.filter(p => p.id !== phaseId)
+      })
+      setFeatures(prev => {
+        featureSnapshot = prev
+        return prev.filter(f => f.phase_id !== phaseId)
+      })
+
       try {
-        // Features cascade delete via DB foreign key,
-        // but we also remove them from local state explicitly
         const { error } = await supabase
           .from('phases')
           .delete()
@@ -246,15 +260,12 @@ export function useProjectData(
 
         if (error) throw error
 
-        // Optimistic update — remove phase and its features
-        setPhases(prev => prev.filter(p => p.id !== phaseId))
-        setFeatures(prev =>
-          prev.filter(f => f.phase_id !== phaseId)
-        )
         toast.success('Phase deleted')
       } catch (err) {
         console.error('[useProjectData] deletePhase error:', err)
         toast.error('Failed to delete phase')
+        setPhases(phaseSnapshot) // rollback
+        setFeatures(featureSnapshot)
       }
     },
     []
@@ -319,6 +330,16 @@ export function useProjectData(
         'name' | 'description' | 'status' | 'type' | 'priority' | 'phase_id'
       >>
     ): Promise<void> => {
+      // True optimistic update: apply locally first for instant UI
+      // (e.g. Board drag-drop), then persist. Roll back on failure.
+      let snapshot: Feature[] = []
+      setFeatures(prev => {
+        snapshot = prev
+        return prev.map(f =>
+          f.id === featureId ? { ...f, ...updates } : f
+        )
+      })
+
       try {
         const { error } = await supabase
           .from('features')
@@ -326,16 +347,10 @@ export function useProjectData(
           .eq('id', featureId)
 
         if (error) throw error
-
-        // Optimistic update
-        setFeatures(prev =>
-          prev.map(f =>
-            f.id === featureId ? { ...f, ...updates } : f
-          )
-        )
       } catch (err) {
         console.error('[useProjectData] updateFeature error:', err)
         toast.error('Failed to update feature')
+        setFeatures(snapshot) // rollback
       }
     },
     []
@@ -343,6 +358,13 @@ export function useProjectData(
 
   const deleteFeature = useCallback(
     async (featureId: string): Promise<void> => {
+      // Optimistic remove first, restore on failure.
+      let snapshot: Feature[] = []
+      setFeatures(prev => {
+        snapshot = prev
+        return prev.filter(f => f.id !== featureId)
+      })
+
       try {
         const { error } = await supabase
           .from('features')
@@ -351,14 +373,11 @@ export function useProjectData(
 
         if (error) throw error
 
-        // Optimistic update
-        setFeatures(prev =>
-          prev.filter(f => f.id !== featureId)
-        )
         toast.success('Feature deleted')
       } catch (err) {
         console.error('[useProjectData] deleteFeature error:', err)
         toast.error('Failed to delete feature')
+        setFeatures(snapshot) // rollback
       }
     },
     []
@@ -374,14 +393,21 @@ export function useProjectData(
       orderedFeatureIds: string[]
     ): Promise<void> => {
       try {
-        // Optimistic update first for instant UI response
+        // Optimistic update first for instant UI response.
+        // Build a new priority map and map to NEW feature objects —
+        // never mutate the objects held in state (breaks React equality
+        // checks and can desync the shared Graph/Board views).
         setFeatures(prev => {
-          const updated = [...prev]
-          orderedFeatureIds.forEach((id, index) => {
-            const feature = updated.find(f => f.id === id)
-            if (feature) feature.priority = index + 1
-          })
-          return updated.sort((a, b) => a.priority - b.priority)
+          const priorityById = new Map(
+            orderedFeatureIds.map((id, index) => [id, index + 1])
+          )
+          return prev
+            .map(f =>
+              priorityById.has(f.id)
+                ? { ...f, priority: priorityById.get(f.id)! }
+                : f
+            )
+            .sort((a, b) => a.priority - b.priority)
         })
 
         // Batch update all affected features

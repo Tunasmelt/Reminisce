@@ -3,12 +3,12 @@
 import { useState, useEffect } from 'react'
 import { ProtectedRoute } from '@/components/protected-route'
 import { supabase } from '@/lib/supabase'
+import { useAuthStore } from '@/store/auth'
 import { useRouter } from 'next/navigation'
 import Link from 'next/link'
 import { LogOut } from 'lucide-react'
 import { useTheme } from '@/hooks/useTheme'
 import ReminisceLogo from '@/components/ReminisceLogo'
-import { User } from '@supabase/supabase-js'
 import { toast } from 'sonner'
 import { getTimeUntilUTCReset } from '@/lib/wallet'
 import ThemeToggle from '@/components/theme-toggle'
@@ -24,7 +24,12 @@ function hexToRgba(hex: string, a: number) {
 export default function DashboardLayout({ children }: { children: React.ReactNode }) {
   const router = useRouter()
   const { accent } = useTheme()
-  const [user, setUser] = useState<User | null>(null)
+  // AU-8: Read the already-verified user from the Zustand auth store instead
+  // of firing a redundant getUser() call. ProtectedRoute (wrapping this layout)
+  // guarantees the user is non-null before this component renders. A separate
+  // getUser() call creates a second network round-trip and shows '?' avatar if
+  // it fails, even though the session is valid.
+  const { user } = useAuthStore()
   const [wallet, setWallet] = useState<{ gems: number, coins: number } | null>(null)
   const [resetLabel, setResetLabel] = useState<string>(getTimeUntilUTCReset())
   const [userPlan, setUserPlan] = useState<'free' | 'pro'>('free')
@@ -39,42 +44,45 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
   }, [])
 
   useEffect(() => {
-    supabase.auth.getUser().then(({ data }) => {
-      if (data.user) {
-        setUser(data.user)
-        // Fetch wallet
-        supabase
-          .from('user_wallets')
-          .select('gems, coins')
-          .eq('user_id', data.user.id)
-          .single()
-          .then(({ data: walletData }) => {
-            if (walletData) {
-              setWallet(walletData)
-            }
+    // AU-8: user is sourced from the auth store (already verified by ProtectedRoute).
+    // Guard defensively in case this effect fires before the store hydrates.
+    if (!user) return
+
+    // Fetch wallet
+    supabase
+      .from('user_wallets')
+      .select('gems, coins')
+      .eq('user_id', user.id)
+      .single()
+      .then(({ data: walletData }) => {
+        if (walletData) setWallet(walletData)
+      })
+
+    // Fetch plan
+    supabase
+      .from('user_plans')
+      .select('plan')
+      .eq('user_id', user.id)
+      .single()
+      .then(({ data: planData }) => {
+        if (planData) setUserPlan(planData.plan as 'free' | 'pro')
+      })
+
+    // Fire daily login reward silently.
+    // AU-14: The server already has a date-gated idempotency check so a
+    // duplicate call won't double-award — but it wastes a round-trip.
+    // Use a sessionStorage flag to skip the call when the layout re-mounts
+    // (e.g. user navigates to landing and back) within the same browser tab.
+    const rewardKey = `reminisce_daily_reward_${user.id}_${new Date().toISOString().slice(0, 10)}`
+    const alreadyFired = (() => { try { return sessionStorage.getItem(rewardKey) === '1' } catch { return false } })()
+    if (!alreadyFired) {
+      supabase.auth.getSession().then(({ data: { session } }) => {
+        if (session?.access_token) {
+          try { sessionStorage.setItem(rewardKey, '1') } catch { /* non-fatal */ }
+          fetch('/api/rewards/daily-login', {
+            method: 'POST',
+            headers: { 'Authorization': `Bearer ${session.access_token}` },
           })
-        
-        // Fetch plan
-        supabase
-          .from('user_plans')
-          .select('plan')
-          .eq('user_id', data.user.id)
-          .single()
-          .then(({ data: planData }) => {
-            if (planData) {
-              setUserPlan(planData.plan as 'free'|'pro')
-            }
-          })
-        
-        // Fire daily login reward silently
-        supabase.auth.getSession().then(({ data: { session } }) => {
-          if (session?.access_token) {
-            fetch('/api/rewards/daily-login', {
-              method: 'POST',
-              headers: {
-                'Authorization': `Bearer ${session.access_token}`,
-              },
-            })
             .then(r => r.json())
             .then(result => {
               if (result.awarded && result.amount > 0) {
@@ -82,24 +90,23 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
                   duration: 3000,
                   position: 'bottom-right',
                 })
-                // Refresh wallet display to show new coins
+                // Refresh wallet to show new coins
                 supabase
                   .from('user_wallets')
                   .select('gems, coins')
-                  .eq('user_id', data.user!.id)
+                  .eq('user_id', user.id)
                   .single()
-                  .then(({ data: w }) => {
-                    if (w) setWallet(w)
-                  })
+                  .then(({ data: w }) => { if (w) setWallet(w) })
               }
             })
-            .catch(() => {
-              // Non-fatal — silent fail
-            })
-          }
-        })
-      }
-    })
+            .catch(() => { /* non-fatal */ })
+        }
+      })
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user?.id])
+
+  useEffect(() => {
     const check = () => setIsMobile(window.innerWidth < 768)
     check()
     window.addEventListener('resize', check)

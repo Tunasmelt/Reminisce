@@ -17,10 +17,7 @@ interface Template {
   updated_at: string
 }
 
-interface Project {
-  id: string
-  name: string
-}
+import { Project } from '@/types/project'
 
 function hexToRgba(hex: string, a: number) {
   const r = parseInt(hex.slice(1, 3), 16)

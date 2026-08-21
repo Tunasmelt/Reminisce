@@ -5,7 +5,7 @@ import { useParams, usePathname } from 'next/navigation'
 import Link from 'next/link'
 import { 
   LayoutDashboard, Wand2, 
-  GitBranch, LayoutGrid, MessageSquare, Bot, 
+  GitBranch, LayoutGrid, MessageSquare, Bot,
   FlaskConical, Settings, ChevronLeft,
   ChevronRight
 } from 'lucide-react'
@@ -13,13 +13,7 @@ import { useRouter } from 'next/navigation'
 import { useTheme } from '@/hooks/useTheme'
 import { useKeyboardShortcuts } from '@/hooks/useKeyboardShortcuts'
 import { supabase } from '@/lib/supabase'
-
-function hexToRgba(hex: string, a: number) {
-  const r = parseInt(hex.slice(1,3),16)
-  const g = parseInt(hex.slice(3,5),16)
-  const b = parseInt(hex.slice(5,7),16)
-  return `rgba(${r},${g},${b},${a})`
-}
+import { hexToRgba } from '@/lib/utils'
 
 export default function ProjectLayout({ children }: { children: React.ReactNode }) {
   const params = useParams()
@@ -29,6 +23,7 @@ export default function ProjectLayout({ children }: { children: React.ReactNode 
   const projectId = params.id as string
   const [projectName, setProjectName] = useState('')
   const [pamReminderCount, setPamReminderCount] = useState(0)
+  const [userRole, setUserRole] = useState<'head' | 'collaborator' | 'viewer' | null>(null)
 
   const [collapsed, setCollapsed] = useState(false)
   const [showShortcuts, setShowShortcuts] = useState(false)
@@ -93,6 +88,23 @@ export default function ProjectLayout({ children }: { children: React.ReactNode 
         })
         .catch(() => { /* non-fatal */ })
     })
+
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      if (!session) return
+      fetch(`/api/team/members?projectId=${projectId}`, {
+        headers: { Authorization: `Bearer ${session.access_token}` },
+      })
+        .then(r => r.json())
+        .then(d => {
+          if (d.members) {
+            const me = d.members.find(
+              (m: { user_id: string }) => m.user_id === session.user.id
+            )
+            setUserRole(me?.role ?? 'head') // default to head if not found (owner)
+          }
+        })
+        .catch(() => {})
+    })
   }, [projectId])
 
   const navItems = [
@@ -100,7 +112,7 @@ export default function ProjectLayout({ children }: { children: React.ReactNode 
       label: 'Overview', icon: LayoutDashboard,
       href: `/dashboard/projects/${projectId}`
     },
-    { 
+    {
       label: 'Wizard', icon: Wand2,
       href: `/dashboard/projects/${projectId}/wizard`
     },
@@ -130,6 +142,19 @@ export default function ProjectLayout({ children }: { children: React.ReactNode 
       href: `/dashboard/projects/${projectId}/settings`
     },
   ]
+
+  const visibleNavItems = navItems.filter(item => {
+    if (userRole === 'viewer') {
+      // Viewers can only see these tabs
+      return ['Overview', 'Graph', 'Board', 'Prompts', 'API Lab'].includes(item.label)
+    }
+    if (userRole === 'collaborator') {
+      // Collaborators see everything except Wizard and Settings
+      return !['Wizard', 'Settings'].includes(item.label)
+    }
+    // Head sees everything
+    return true
+  })
 
   const sidebarW = collapsed ? 52 : 220
 
@@ -225,7 +250,7 @@ export default function ProjectLayout({ children }: { children: React.ReactNode 
           flex: 1, overflowY: 'auto',
           padding: collapsed ? '8px 0' : '8px',
         }}>
-          {navItems.map(item => {
+          {visibleNavItems.map(item => {
             const Icon = item.icon
             const isActive = pathname === item.href
               || (item.href !== `/dashboard/projects/${projectId}`

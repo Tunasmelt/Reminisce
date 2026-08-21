@@ -19,6 +19,7 @@ const ReactMarkdown = dynamic(() => import('react-markdown'), { ssr: false })
 import { readSSEStream, stripPamAction } from '@/lib/stream-parser'
 import { useTheme } from '@/hooks/useTheme'
 import CustomSelect from '@/components/CustomSelect'
+import { hexToRgba } from '@/lib/utils'
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -51,14 +52,6 @@ interface PendingAction {
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-function hexToRgba(hex: string, a: number) {
-  if (!hex || hex.length < 7) return `rgba(245,158,11,${a})`
-  const r = parseInt(hex.slice(1, 3), 16)
-  const g = parseInt(hex.slice(3, 5), 16)
-  const b = parseInt(hex.slice(5, 7), 16)
-  return `rgba(${r},${g},${b},${a})`
-}
-
 function formatTime(iso: string) {
   return new Date(iso).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
 }
@@ -90,48 +83,55 @@ function actionLabel(type: string, payload: Record<string, unknown>): string {
 
 const FALLBACK_MODELS = [
   // ── Free tier — Groq (fast LPU inference) ──────────────────────────────
-  { provider: 'groq', model: 'llama-3.1-8b-instant',                      label: 'Llama 3.1 8B',           free: true  },
-  { provider: 'groq', model: 'llama-3.3-70b-versatile',                   label: 'Llama 3.3 70B',           free: true  },
-  { provider: 'groq', model: 'meta-llama/llama-4-scout-17b-16e-instruct', label: 'Llama 4 Scout ⚡',        free: true  },
-  { provider: 'groq', model: 'meta-llama/llama-4-maverick',               label: 'Llama 4 Maverick',        free: true  },
-  { provider: 'groq', model: 'moonshotai/kimi-k2',                        label: 'Kimi K2',                 free: true  },
-  { provider: 'groq', model: 'qwen-qwen3-32b',                            label: 'Qwen3 32B',               free: true  },
+  { provider: 'groq', model: 'llama-3.1-8b-instant',                             label: 'Llama 3.1 8B',              free: true  },
+  { provider: 'groq', model: 'llama-3.3-70b-versatile',                          label: 'Llama 3.3 70B',              free: true  },
+  { provider: 'groq', model: 'meta-llama/llama-4-scout-17b-16e-instruct',        label: 'Llama 4 Scout ⚡',           free: true  },
+  { provider: 'groq', model: 'meta-llama/llama-4-maverick-17b-128e-instruct',    label: 'Llama 4 Maverick',           free: true  },
+  { provider: 'groq', model: 'moonshotai/kimi-k2-instruct',                      label: 'Kimi K2',                    free: true  },
+  { provider: 'groq', model: 'qwen/qwen3-32b',                                   label: 'Qwen3 32B',                  free: true  },
 
   // ── Free tier — Cerebras (fastest inference, 1M tokens/day) ────────────
-  { provider: 'cerebras', model: 'llama3.1-8b',                           label: 'Llama 3.1 8B (Cerebras) ⚡', free: true  },
-  { provider: 'cerebras', model: 'llama-4-scout-17b-16e-instruct',        label: 'Llama 4 Scout (Cerebras) ⚡', free: true  },
-  { provider: 'cerebras', model: 'gpt-oss-120b',                          label: 'GPT-OSS 120B (Cerebras) ⚡', free: true  },
+  { provider: 'cerebras', model: 'llama3.1-8b',                                  label: 'Llama 3.1 8B (Cerebras) ⚡', free: true  },
+  { provider: 'cerebras', model: 'llama3.3-70b',                                 label: 'Llama 3.3 70B (Cerebras) ⚡',free: true  },
+  { provider: 'cerebras', model: 'llama-4-scout-17b-16e-instruct',               label: 'Llama 4 Scout (Cerebras) ⚡', free: true  },
+  { provider: 'cerebras', model: 'gpt-oss-120b',                                 label: 'GPT-OSS 120B (Cerebras) ⚡', free: true  },
 
   // ── Free tier — SambaNova (ultra-fast RDU inference) ───────────────────
-  { provider: 'sambanova', model: 'DeepSeek-V3.2',                        label: 'DeepSeek V3.2',           free: true  },
-  { provider: 'sambanova', model: 'DeepSeek-R1-Distill-Llama-70B',        label: 'DeepSeek R1 Distill',     free: true  },
-  { provider: 'sambanova', model: 'Llama-4-Maverick-17B-128E-Instruct',   label: 'Llama 4 Maverick (SN)',   free: true  },
-  { provider: 'sambanova', model: 'Meta-Llama-3.3-70B-Instruct',          label: 'Llama 3.3 70B (SN)',      free: true  },
+  { provider: 'sambanova', model: 'DeepSeek-V3.2',                               label: 'DeepSeek V3.2',              free: true  },
+  { provider: 'sambanova', model: 'DeepSeek-R1-Distill-Llama-70B',               label: 'DeepSeek R1 Distill',        free: true  },
+  { provider: 'sambanova', model: 'Llama-4-Maverick-17B-128E-Instruct',          label: 'Llama 4 Maverick (SN)',      free: true  },
+  { provider: 'sambanova', model: 'Meta-Llama-3.3-70B-Instruct',                 label: 'Llama 3.3 70B (SN)',         free: true  },
 
   // ── Free tier — OpenRouter (20 RPM, `:free` suffix models) ────────────
-  { provider: 'openrouter', model: 'meta-llama/llama-3.3-70b-instruct:free', label: 'Llama 3.3 70B (OR)',  free: true  },
-  { provider: 'openrouter', model: 'meta-llama/llama-4-maverick:free',        label: 'Llama 4 Maverick (OR)',free: true },
-  { provider: 'openrouter', model: 'deepseek/deepseek-chat-v3.1:free',        label: 'DeepSeek V3.1',        free: true },
-  { provider: 'openrouter', model: 'qwen/qwen3-235b-a22b:free',               label: 'Qwen3 235B',           free: true },
+  { provider: 'openrouter', model: 'meta-llama/llama-3.3-70b-instruct:free',     label: 'Llama 3.3 70B (OR)',         free: true  },
+  { provider: 'openrouter', model: 'meta-llama/llama-4-maverick:free',           label: 'Llama 4 Maverick (OR)',      free: true  },
+  { provider: 'openrouter', model: 'deepseek/deepseek-chat-v3.1:free',           label: 'DeepSeek V3.1',              free: true  },
+  { provider: 'openrouter', model: 'deepseek/deepseek-r1:free',                  label: 'DeepSeek R1 (OR)',           free: true  },
+  { provider: 'openrouter', model: 'qwen/qwen3-235b-a22b:free',                  label: 'Qwen3 235B',                 free: true  },
+  { provider: 'openrouter', model: 'google/gemma-3-12b-it:free',                 label: 'Gemma 3 12B',                free: true  },
+
+  // ── Free tier — Gemini (free API quota) ───────────────────────────────
+  { provider: 'gemini',    model: 'gemini-2.0-flash',                            label: 'Gemini 2.0 Flash',           free: true  },
+  { provider: 'gemini',    model: 'gemini-2.5-flash',                            label: 'Gemini 2.5 Flash',           free: true  },
 
   // ── Pro tier — Anthropic ───────────────────────────────────────────────
-  { provider: 'anthropic', model: 'claude-haiku-4-5-20251001',            label: 'Claude Haiku 4.5',        free: false },
-  { provider: 'anthropic', model: 'claude-sonnet-4-20250514',             label: 'Claude Sonnet 4',         free: false },
-  { provider: 'anthropic', model: 'claude-opus-4-5-20251101',             label: 'Claude Opus 4',           free: false },
+  { provider: 'anthropic', model: 'claude-haiku-4-5-20251001',                   label: 'Claude Haiku 4.5',           free: false },
+  { provider: 'anthropic', model: 'claude-sonnet-4-20250514',                    label: 'Claude Sonnet 4',            free: false },
+  { provider: 'anthropic', model: 'claude-3-5-sonnet-20241022',                  label: 'Claude 3.5 Sonnet',          free: false },
+  { provider: 'anthropic', model: 'claude-3-5-haiku-20241022',                   label: 'Claude 3.5 Haiku',           free: false },
 
   // ── Pro tier — Google ──────────────────────────────────────────────────
-  { provider: 'gemini',    model: 'gemini-2.5-flash',                     label: 'Gemini 2.5 Flash',        free: false },
-  { provider: 'gemini',    model: 'gemini-2.5-pro',                       label: 'Gemini 2.5 Pro',          free: false },
+  { provider: 'gemini',    model: 'gemini-2.5-pro',                              label: 'Gemini 2.5 Pro',             free: false },
 
   // ── Pro tier — OpenAI ──────────────────────────────────────────────────
-  { provider: 'openai',    model: 'gpt-4o-mini',                          label: 'GPT-4o Mini',             free: false },
-  { provider: 'openai',    model: 'gpt-4o',                               label: 'GPT-4o',                  free: false },
-  { provider: 'openai',    model: 'gpt-4.1',                              label: 'GPT-4.1',                 free: false },
+  { provider: 'openai',    model: 'gpt-4o-mini',                                 label: 'GPT-4o Mini',                free: false },
+  { provider: 'openai',    model: 'gpt-4o',                                      label: 'GPT-4o',                     free: false },
+  { provider: 'openai',    model: 'gpt-4.1',                                     label: 'GPT-4.1',                    free: false },
 
   // ── Pro tier — Mistral ─────────────────────────────────────────────────
-  { provider: 'mistral',   model: 'codestral-latest',                     label: 'Codestral',               free: false },
-  { provider: 'mistral',   model: 'mistral-small-latest',                 label: 'Mistral Small',           free: false },
-  { provider: 'mistral',   model: 'mistral-large-latest',                 label: 'Mistral Large',           free: false },
+  { provider: 'mistral',   model: 'codestral-latest',                            label: 'Codestral',                  free: false },
+  { provider: 'mistral',   model: 'mistral-small-latest',                        label: 'Mistral Small',              free: false },
+  { provider: 'mistral',   model: 'mistral-large-latest',                        label: 'Mistral Large',              free: false },
 ]
 
 const SLASH_COMMANDS = [
@@ -463,6 +463,12 @@ function ThreadItem({
               if (e.key === 'Enter') commitRename()
               if (e.key === 'Escape') setEditing(false)
             }}
+            // AR-16: commit rename on blur so clicking away doesn't silently
+            // discard the user's typed title. The ✓ button uses onMouseDown
+            // preventDefault so its click fires before the blur event, avoiding
+            // a double-commit race where blur would call commitRename and then
+            // the click handler would call it again.
+            onBlur={commitRename}
             style={{
               flex: 1, background: 'rgba(255,255,255,0.08)',
               border: `1px solid ${accent}`,
@@ -470,7 +476,11 @@ function ThreadItem({
               fontSize: 12, color: '#fff', outline: 'none',
             }}
           />
-          <button onClick={commitRename} style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#10b981' }}>
+          <button
+            onMouseDown={e => e.preventDefault()}
+            onClick={commitRename}
+            style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#10b981' }}
+          >
             <Check size={13}/>
           </button>
           <button onClick={() => setEditing(false)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'rgba(255,255,255,0.3)' }}>
@@ -785,6 +795,11 @@ function PAMContent() {
   const [cmdIndex,       setCmdIndex]       = useState(0)
   const [mentionIndex,   setMentionIndex]   = useState(0)
   const inputRef = useRef<HTMLTextAreaElement>(null)
+  // AR-14: Tracks the AbortController for the active PAM SSE stream so we can
+  // cancel it when the user switches threads before the stream completes.
+  // Without an abort, two concurrent streams write into streamText simultaneously
+  // producing interleaved, garbled output.
+  const streamAbortRef = useRef<AbortController | null>(null)
 
   const [models, setModels] = useState(FALLBACK_MODELS)
   const [selectedModel, setSelectedModel] = useState(FALLBACK_MODELS[0])
@@ -804,6 +819,15 @@ function PAMContent() {
   const [hasScopeDrift, setHasScopeDrift] = useState(false)
   const messagesEndRef = useRef<HTMLDivElement>(null)
 
+  // AR-16: Cancel any in-flight SSE stream when the component unmounts
+  // (e.g. the user navigates away mid-stream). Without this the fetch keeps
+  // running in the background, consuming tokens and writing state into a
+  // component that no longer exists — which can cause React setState-on-
+  // unmounted-component warnings.
+  useEffect(() => {
+    return () => { streamAbortRef.current?.abort() }
+  }, [])
+
   // ── Init ───────────────────────────────────────────────────────────────────
   useEffect(() => {
     // Restore model preference from localStorage
@@ -821,20 +845,36 @@ function PAMContent() {
   useEffect(() => {
     supabase.auth.getSession().then(({ data: { session } }) => {
       if (!session) return
-      fetch('/api/keys/models', {
-        headers: { Authorization: `Bearer ${session.access_token}` },
-      })
-        .then(r => r.json())
-        .then(data => {
+
+      const run = async () => {
+        // Fetch user plan
+        const { data: planData } = await supabase
+          .from('user_plans')
+          .select('plan')
+          .eq('user_id', session.user.id)
+          .single()
+        const currentPlan = (planData?.plan as 'free' | 'pro') ?? 'free'
+
+        // Fetch models
+        try {
+          const res = await fetch('/api/keys/models', {
+            headers: { Authorization: `Bearer ${session.access_token}` },
+          })
+          const data = await res.json()
           if (Array.isArray(data.models) && data.models.length > 0) {
-            setModels(data.models)
+            // Filter: free users only see free models
+            const filtered = (data.models as typeof FALLBACK_MODELS).filter(
+              m => currentPlan === 'pro' || m.free
+            )
+            setModels(filtered)
             // If current selected model is no longer available, reset to first
-            if (!data.models.find((m: { model: string }) => m.model === selectedModel?.model)) {
-              setSelectedModel(data.models[0])
+            if (!filtered.find(m => m.model === selectedModel?.model)) {
+              setSelectedModel(filtered[0])
             }
           }
-        })
-        .catch(() => { /* keep FALLBACK_MODELS */ })
+        } catch { /* keep FALLBACK_MODELS */ }
+      }
+      run()
     })
   }, [selectedModel?.model])
 
@@ -935,9 +975,17 @@ function PAMContent() {
   }, [])
 
   const selectThread = useCallback(async (threadId: string) => {
+    // AR-14: abort any in-flight SSE stream before switching threads. Without
+    // this, two streams can write into streamText simultaneously producing
+    // interleaved, garbled output in the new thread's bubble.
+    if (streamAbortRef.current) {
+      streamAbortRef.current.abort()
+      streamAbortRef.current = null
+    }
+    setIsStreaming(false)
+    setStreamText('')
     setActiveThread(threadId)
     localStorage.setItem(THREAD_KEY, threadId)
-    setStreamText('')
     setPendingAction(null)
     await loadMessages(threadId)
   }, [loadMessages])
@@ -1076,6 +1124,10 @@ function PAMContent() {
     setMessages([optimisticMsg])
 
     try {
+      // AR-14: register AbortController so selectThread can cancel this stream.
+      const abortCtrl = new AbortController()
+      streamAbortRef.current = abortCtrl
+
       const { data: { session } } = await supabase.auth.getSession()
       const res = await fetch('/api/pam/message', {
         method: 'POST',
@@ -1090,6 +1142,7 @@ function PAMContent() {
           model:    selectedModel.model,
           content:  briefingMessage,
         }),
+        signal: abortCtrl.signal,
       })
 
       if (!res.ok) throw new Error('Briefing failed')
@@ -1106,10 +1159,13 @@ function PAMContent() {
       setStreamText('')
       await loadThreads()
     } catch (err) {
+      // AR-14: AbortError is intentional — suppress toast.
+      if (err instanceof Error && err.name === 'AbortError') return
       toast.error(err instanceof Error ? err.message : 'Briefing failed')
       setMessages([])
     } finally {
       setIsStreaming(false)
+      streamAbortRef.current = null
     }
   }, [briefingLoading, isStreaming, createThread, projectId,
       selectedModel, loadMessages, loadThreads])
@@ -1147,6 +1203,12 @@ function PAMContent() {
     setMessages(prev => [...prev, optimisticMsg])
 
     try {
+      // AR-14: create a fresh AbortController for this stream. Any previous
+      // controller is already aborted (selectThread handles that); overwrite
+      // the ref so selectThread can cancel this one if the user switches away.
+      const abortCtrl = new AbortController()
+      streamAbortRef.current = abortCtrl
+
       const { data: { session } } = await supabase.auth.getSession()
       const res = await fetch('/api/pam/message', {
         method: 'POST',
@@ -1161,6 +1223,7 @@ function PAMContent() {
           model:    selectedModel.model,
           content:  text,
         }),
+        signal: abortCtrl.signal,
       })
 
       if (res.status === 402) {
@@ -1171,7 +1234,6 @@ function PAMContent() {
       if (!res.ok) throw new Error('PAM request failed')
 
       let full = ''
-      let pamAction: PendingAction | null = null
 
       for await (const chunk of readSSEStream(res.body!)) {
         if (chunk.raw.__pam_meta && chunk.raw.scopeDrift) {
@@ -1183,40 +1245,31 @@ function PAMContent() {
       continue
     }
     if (chunk.raw.__pam_action) {
-          pamAction = {
-            messageId:     '',
-            actionType:    chunk.raw.actionType as string,
-            actionPayload: chunk.raw.actionPayload as Record<string, unknown>,
-          }
+          // Action metadata is persisted server-side and re-derived from the
+          // DB by loadMessages() below; just consume the chunk here so it
+          // isn't appended to the visible message text.
           continue
         }
         full += chunk.delta
         setStreamText(stripPamAction(full))
       }
 
-      // Reload messages from DB (includes saved assistant message with id)
+      // Reload messages from DB (includes saved assistant message with id).
+      // loadMessages already derives & sets pendingAction from the
+      // authoritative DB rows, so no extra wiring is needed here for the
+      // action PAM proposed during the stream.
       await loadMessages(threadId)
       setStreamText('')
       await loadThreads()
-
-      // If PAM proposed an action, find the message id and set pending
-      if (pamAction) {
-        setMessages(prev => {
-          const last = [...prev].reverse().find(
-            m => m.role === 'assistant' && m.action_type && m.action_confirmed === null
-          )
-          if (last) {
-            setPendingAction({ ...pamAction!, messageId: last.id })
-          }
-          return prev
-        })
-      }
     } catch (err) {
+      // AR-14: AbortError is intentional (user switched thread) — don't toast.
+      if (err instanceof Error && err.name === 'AbortError') return
       const msg = err instanceof Error ? err.message : String(err)
       toast.error(msg)
       setMessages(prev => prev.filter(m => m.id !== optimisticMsg.id))
     } finally {
       setIsStreaming(false)
+      streamAbortRef.current = null
     }
   }, [input, isStreaming, activeThread, createThread, projectId, selectedModel, loadMessages, loadThreads])
 
@@ -1396,8 +1449,14 @@ function PAMContent() {
         {/* New thread */}
         <button
           onClick={async () => {
-            // Summarise current thread in background before opening new one
-            if (activeThread && messages.length > 0) {
+            // Soft limit: warn if already has many threads
+            if (threads.length >= 10) {
+              toast.error('Thread limit reached (10 per project). Archive or delete old threads first.')
+              return
+            }
+
+            // Summarise current thread if it has messages
+            if (activeThread && messages.length > 2) {
               const { data: { session } } = await supabase.auth.getSession()
               fetch('/api/pam/summarise', {
                 method: 'POST',
@@ -1414,10 +1473,11 @@ function PAMContent() {
             }
             const id = await createThread()
             setActiveThread(id)
-    localStorage.setItem(THREAD_KEY, id)
+            localStorage.setItem(THREAD_KEY, id)
             setMessages([])
             setPendingAction(null)
             setStreamText('')
+            setHasScopeDrift(false)
           }}
           style={{
             display: 'flex', alignItems: 'center', gap: 6,
@@ -1891,10 +1951,38 @@ function PAMContent() {
                       })()}
                     </div>
 
-                    {/* Timestamp */}
-                    <div style={{ fontSize: 10, color: 'rgba(255,255,255,0.2)', marginTop: 8, textAlign: isUser ? 'right' : 'left' }}>
-                      {formatTime(msg.created_at)}
-                      {msg.tokens_used && !isUser ? ` · ~${msg.tokens_used} tokens` : ''}
+                    {/* Timestamp + Copy (AR-12, AR-18) */}
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 8, justifyContent: isUser ? 'flex-end' : 'flex-start' }}>
+                      <span style={{ fontSize: 10, color: 'rgba(255,255,255,0.2)' }}>
+                        {formatTime(msg.created_at)}
+                        {/* AR-12: Append "(est.)" so users understand this is an approximation,
+                            not a provider-reported token count. */}
+                        {msg.tokens_used && !isUser ? ` · ~${msg.tokens_used} tokens (est.)` : ''}
+                      </span>
+                      {/* AR-18: Copy button on assistant bubbles only */}
+                      {!isUser && (
+                        <button
+                          onClick={() => {
+                            navigator.clipboard.writeText(msg.content).then(() => {
+                              toast.success('Copied to clipboard')
+                            }).catch(() => {
+                              toast.error('Copy failed')
+                            })
+                          }}
+                          title="Copy response"
+                          style={{
+                            background: 'none', border: 'none',
+                            cursor: 'pointer', padding: '1px 4px',
+                            fontSize: 10, color: 'rgba(255,255,255,0.2)',
+                            borderRadius: 4,
+                            transition: 'color 0.15s',
+                          }}
+                          onMouseEnter={e => { e.currentTarget.style.color = 'rgba(255,255,255,0.55)' }}
+                          onMouseLeave={e => { e.currentTarget.style.color = 'rgba(255,255,255,0.2)' }}
+                        >
+                          ⎘ Copy
+                        </button>
+                      )}
                     </div>
                   </div>
                 </div>
@@ -2160,7 +2248,13 @@ function PAMContent() {
                   if (showCommands) {
                     if (e.key === 'ArrowDown') {
                       e.preventDefault()
-                      setCmdIndex(i => i + 1)
+                      // AR-17: clamp to list length so the highlight doesn't
+                      // drift past the last visible item when the user holds ↓.
+                      const filtered = SLASH_COMMANDS.filter(c =>
+                        c.cmd.includes(cmdQuery.toLowerCase()) ||
+                        c.label.toLowerCase().includes(cmdQuery.toLowerCase())
+                      )
+                      setCmdIndex(i => Math.min(i + 1, Math.max(0, filtered.length - 1)))
                       return
                     }
                     if (e.key === 'ArrowUp') {

@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { useParams } from 'next/navigation'
 import { toast } from 'sonner'
 import { supabase } from '@/lib/supabase'
@@ -83,7 +83,7 @@ export default function ContextPage() {
   // ── File system hook — Phase 2 additions ───────────────────────────────────
   const {
     isConnected, isSupported,
-    openFolder,
+    openFolder, reconnectFolder, needsReconnect, folderName,
     gitState, pendingChanges,
     syncFromLocal, pushToLocal,
   } = useFileSystem(projectId)
@@ -93,6 +93,7 @@ export default function ContextPage() {
   const [contextFiles,  setContextFiles]  = useState<ContextFile[]>([])
   const [selectedFile,  setSelectedFile]  = useState<ContextFile | null>(null)
   const [loading,       setLoading]       = useState(true)
+  const [userRole, setUserRole] = useState<string>('head')
 
   // ── Edit state ─────────────────────────────────────────────────────────────
   const [isEditing,       setIsEditing]       = useState(false)
@@ -122,6 +123,17 @@ export default function ContextPage() {
     return () => window.removeEventListener('resize', check)
   }, [])
 
+  // FS-16: selectedFile is used inside loadFiles only to guard auto-selection
+  // ("if nothing is selected yet, pick the first file"). Including it in the
+  // useCallback dep array makes loadFiles a new function reference on every
+  // file-selection change, which was harmless but forced unnecessary re-renders.
+  // More importantly, the useEffect below intentionally only fires on projectId
+  // change — so the eslint-disable suppressed a stale-closure warning that was
+  // technically correct. Fix: read selectedFile from a ref so loadFiles never
+  // needs it in its dep array and the stale-closure is gone.
+  const selectedFileRef = useRef<ContextFile | null>(null)
+  useEffect(() => { selectedFileRef.current = selectedFile }, [selectedFile])
+
   // ── Load all context files ─────────────────────────────────────────────────
   const loadFiles = useCallback(async () => {
     setLoading(true)
@@ -135,10 +147,23 @@ export default function ContextPage() {
           .order('file_path', { ascending: true }),
       ])
       if (proj)   setProject(proj)
+
+      // Get user role
+      const { data: { user: authUser } } = await supabase.auth.getUser()
+      if (authUser) {
+        const { data: memberRow } = await supabase
+          .from('project_members')
+          .select('role')
+          .eq('project_id', projectId)
+          .eq('user_id', authUser.id)
+          .eq('invite_status', 'accepted')
+          .single()
+        setUserRole(memberRow?.role ?? 'head')
+      }
       if (files) {
         setContextFiles(files as ContextFile[])
         // Auto-select the master prompt or architecture file if nothing is selected
-        if (!selectedFile && files.length > 0) {
+        if (!selectedFileRef.current && files.length > 0) {
           const master = files.find(f => f.file_path.includes('master-prompt'))
             ?? files.find(f => f.file_path.includes('architecture'))
             ?? files[0]
@@ -152,7 +177,7 @@ export default function ContextPage() {
     } finally {
       setLoading(false)
     }
-  }, [projectId, selectedFile])
+  }, [projectId])
 
   useEffect(() => { loadFiles() }, [projectId]) // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -236,8 +261,10 @@ export default function ContextPage() {
     try {
       await syncFromLocal()
       await loadFiles()
-      toast.success('Synced from local folder')
-    } catch { /* error already toasted by hook */ }
+      // FS-8: Removed redundant toast — syncFromLocal already emits a
+      // per-file success/failure toast with the file count. A second
+      // generic toast here was producing duplicate notifications.
+    } catch { /* errors already toasted by hook */ }
     finally {
       setIsSyncing(false)
       setShowSyncConfirm(false)
@@ -255,7 +282,13 @@ export default function ContextPage() {
         .forEach(f => { filesToPush[f.file_path] = f.content! })
 
       const written = await pushToLocal(filesToPush)
-      toast.success(`${written} file${written !== 1 ? 's' : ''} written to local folder`)
+      // FS-14: Skip the success toast when written === 0 — this happens when
+      // every file was skipped due to local edits (hook already shows an error
+      // toast for those). "0 files written to local folder" is confusing because
+      // the user clicked Push and nothing appeared to happen.
+      if (written > 0) {
+        toast.success(`${written} file${written !== 1 ? 's' : ''} written to local folder`)
+      }
       // Update last_synced_at timestamp in local state
       const now = new Date().toISOString()
       setContextFiles(prev => prev.map(f =>
@@ -358,15 +391,20 @@ export default function ContextPage() {
           )}
 
           {/* Folder connect / sync controls */}
-          {isSupported && !isConnected ? (
+          {userRole === 'head' && isSupported && !isConnected && (
+            // FS-2: Show "Reconnect folder" when a stored handle exists but
+            // Chrome downgraded its permission to 'prompt' — reconnectFolder()
+            // calls requestPermission() from this click handler (user gesture).
             <button
-              onClick={openFolder}
+              onClick={needsReconnect ? reconnectFolder : openFolder}
               style={{ width: '100%', display: 'flex', alignItems: 'center', gap: 6, padding: '7px 10px', background: hexToRgba(accent, 0.08), border: `1px solid ${hexToRgba(accent, 0.25)}`, borderRadius: 7, cursor: 'pointer', fontSize: 10, fontWeight: 700, color: accent }}
             >
               <FolderOpen size={12} />
-              Connect folder
+              {needsReconnect ? `Reconnect "${folderName ?? 'folder'}"` : 'Connect folder'}
             </button>
-          ) : isConnected ? (
+          )}
+
+          {userRole === 'head' && isConnected && (
             <div style={{ display: 'flex', gap: 6 }}>
               <button
                 onClick={() => setShowSyncConfirm(true)}
@@ -387,7 +425,22 @@ export default function ContextPage() {
                 {isPushing ? 'Pushing…' : 'Push'}
               </button>
             </div>
-          ) : null}
+          )}
+
+          {userRole !== 'head' && (
+            <div style={{
+              padding: '12px 16px', marginTop: 10,
+              background: 'rgba(96,165,250,0.06)',
+              border: '1px solid rgba(96,165,250,0.18)',
+              borderRadius: 12, fontSize: 12,
+              color: 'rgba(255,255,255,0.55)',
+              lineHeight: 1.6,
+            }}>
+              <strong style={{ color: '#60a5fa' }}>Context is shared from the database.</strong>{' '}
+              To sync files to your local machine, connect your own project folder below.
+              The project head manages which context files are generated and pushed.
+            </div>
+          )}
         </div>
 
         {/* File list */}
@@ -516,7 +569,26 @@ export default function ContextPage() {
             {selectedFile && (
               <div style={{ display: 'flex', gap: 20, alignSelf: 'stretch' }}>
                 <button
-                  onClick={() => { setShowDiff(!showDiff); setIsEditing(false) }}
+                  onClick={() => {
+                    // FS-18: Seed the diff pickers with sensible defaults when
+                    // opening the Diff tab so the user sees a comparison
+                    // immediately instead of two empty dropdowns.
+                    // Priority: local-vs-DB (if local changes exist), then
+                    // previous-vs-latest (if ≥ 2 versions), else leave blank
+                    // (the "Nothing to diff" empty-state will be shown).
+                    if (!showDiff) {
+                      if (pendingForSelected) {
+                        setDiffFrom('local')
+                        setDiffTo('db')
+                      } else if (versions.length >= 2) {
+                        // versions[0] is latest, versions[1] is one before
+                        setDiffFrom(versions[1].id)
+                        setDiffTo(versions[0].id)
+                      }
+                    }
+                    setShowDiff(!showDiff)
+                    setIsEditing(false)
+                  }}
                   style={{
                     padding: '13px 0',
                     background: 'transparent',
@@ -606,13 +678,15 @@ export default function ContextPage() {
                   )
                 })()}
 
-                <button
-                  onClick={handleSave}
-                  disabled={isSaving}
-                  style={{ background: isSaving ? 'rgba(255,255,255,0.1)' : accent, color: isSaving ? 'rgba(255,255,255,0.3)' : '#000', border: 'none', borderRadius: 7, padding: '6px 16px', fontSize: 9, fontWeight: 800, letterSpacing: '0.08em', textTransform: 'uppercase', cursor: isSaving ? 'not-allowed' : 'pointer' }}
-                >
-                  {isSaving ? 'Saving…' : 'Save'}
-                </button>
+                {userRole !== 'viewer' && (
+                  <button
+                    onClick={handleSave}
+                    disabled={isSaving}
+                    style={{ background: isSaving ? 'rgba(255,255,255,0.1)' : accent, color: isSaving ? 'rgba(255,255,255,0.3)' : '#000', border: 'none', borderRadius: 7, padding: '6px 16px', fontSize: 9, fontWeight: 800, letterSpacing: '0.08em', textTransform: 'uppercase', cursor: isSaving ? 'not-allowed' : 'pointer' }}
+                  >
+                    {isSaving ? 'Saving…' : 'Save'}
+                  </button>
+                )}
               </>
             )}
           </div>
@@ -649,6 +723,18 @@ export default function ContextPage() {
           {!selectedFile ? (
             <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'rgba(255,255,255,0.2)', fontSize: 13 }}>
               Select a file from the left panel
+            </div>
+          ) : showDiff && !(versions.length >= 2 || pendingForSelected) ? (
+            // FS-9: showDiff is true but there's nothing to diff — only 1 version
+            // and no local changes. Previously this fell through to the read-only
+            // view silently, making "Diff" appear to do nothing.
+            <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 8, padding: 32 }}>
+              <div style={{ fontSize: 22, opacity: 0.3 }}>⊘</div>
+              <div style={{ fontSize: 13, fontWeight: 600, color: 'rgba(255,255,255,0.3)' }}>Nothing to diff</div>
+              <div style={{ fontSize: 11, color: 'rgba(255,255,255,0.2)', textAlign: 'center', maxWidth: 260, lineHeight: 1.6 }}>
+                No previous versions and no local file changes detected.<br />
+                Edit and save to create a second version, or connect your local folder to compare.
+              </div>
             </div>
           ) : showDiff && (versions.length >= 2 || pendingForSelected) ? (
             <div style={{ flex: 1, overflowY: 'auto', padding: 20 }}>
@@ -766,7 +852,12 @@ export default function ContextPage() {
             versions.map((v, i) => (
               <div
                 key={v.id}
-                onClick={() => { setEditableContent(v.content); setIsEditing(false) }}
+                // FS-5: Switch to edit mode on restore so the historical content
+                // is immediately visible. Previously setIsEditing(false) left the
+                // view panel showing selectedFile.content (current DB version) —
+                // the restored content was loaded into editableContent but hidden.
+                // The unsaved-changes dot (orange) signals "save to confirm restore".
+                onClick={() => { setEditableContent(v.content); setIsEditing(true) }}
                 style={{
                   padding: '10px 14px', cursor: 'pointer',
                   background: 'rgba(255,255,255,0.025)',

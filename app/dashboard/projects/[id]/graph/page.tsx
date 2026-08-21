@@ -27,6 +27,7 @@ import {
 } from '@xyflow/react'
 import '@xyflow/react/dist/style.css'
 import { Layers, Box, Lock, Unlock, RefreshCw, LayoutGrid } from 'lucide-react'
+import { hexToRgba } from '@/lib/utils'
 
 // ─── Layout constants ─────────────────────────────────────────────────────────
 const NODE_W      = 240
@@ -37,14 +38,6 @@ const COL_GAP     = 40
 const ROW_GAP     = 16
 const PROJECT_Y   = 40
 const PHASES_Y    = 160
-
-function hexToRgba(hex: string, a: number) {
-  if (!hex || hex.length < 7) return `rgba(245,158,11,${a})`
-  const r = parseInt(hex.slice(1,3),16)
-  const g = parseInt(hex.slice(3,5),16)
-  const b = parseInt(hex.slice(5,7),16)
-  return `rgba(${r},${g},${b},${a})`
-}
 
 // ─── Annotation kinds ─────────────────────────────────────────────────────────
 const ANNOTATION_KINDS = [
