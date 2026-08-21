@@ -73,3 +73,7 @@ test-export.zip
 # ─── Reminisce local state ────────────────────────────────────
 # Local folder handles are stored in browser IndexedDB, not files
 # Nothing to ignore here — just documenting intent
+
+# ─── Agent & Scratch files ────────────────────────────────────
+.agents/
+scratch/
