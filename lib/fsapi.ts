@@ -31,11 +31,36 @@ export async function getStoredHandle(
     if (!handle) return null
     const opts: FileSystemHandlePermissionDescriptor = { mode: 'readwrite' }
     const perm = await handle.queryPermission(opts)
-    if (perm === 'granted') return handle
-    const req = await handle.requestPermission(opts)
-    return req === 'granted' ? handle : null
+    // FS-2: Only return the handle when permission is already granted.
+    // requestPermission() requires a user activation (click/keyboard event).
+    // Calling it from a useEffect on mount — without a gesture — causes Chrome
+    // to silently return 'denied', discarding a still-valid stored handle and
+    // breaking the auto-reconnect flow on every page load.
+    // Callers that need to prompt the user must use requestStoredPermission()
+    // from inside a click handler instead.
+    return perm === 'granted' ? handle : null
   } catch (err) {
     console.error('Error getting stored handle', err)
+    return null
+  }
+}
+
+/**
+ * Re-request readwrite permission for a stored handle.
+ * MUST be called from a user-gesture handler (button click / key press).
+ * Returns the handle on success, null if the user denies or the handle is gone.
+ */
+export async function requestStoredPermission(
+  projectId: string,
+): Promise<FileSystemDirectoryHandle | null> {
+  try {
+    const handle = await get<FileSystemDirectoryHandle>(getHandleKey(projectId))
+    if (!handle) return null
+    const opts: FileSystemHandlePermissionDescriptor = { mode: 'readwrite' }
+    const perm = await handle.requestPermission(opts)
+    return perm === 'granted' ? handle : null
+  } catch (err) {
+    console.error('Error requesting stored handle permission', err)
     return null
   }
 }
@@ -61,6 +86,10 @@ async function getDirHandle(
 //  File read / write
 // ─────────────────────────────────────────────────────────────────────────────
 
+// FS-6: Cap to prevent browser freeze when a large file is accidentally read.
+// Context files are markdown — anything over 2 MB is almost certainly wrong.
+const MAX_READ_SIZE_BYTES = 2 * 1024 * 1024 // 2 MB
+
 export async function readFile(
   handle: FileSystemDirectoryHandle,
   path: string,
@@ -71,7 +100,16 @@ export async function readFile(
     : await getDirHandle(handle, path.slice(0, slash), false)
   const name = slash === -1 ? path : path.slice(slash + 1)
   const fh = await dirHandle.getFileHandle(name, { create: false })
-  return await (await fh.getFile()).text()
+  const file = await fh.getFile()
+  // FS-6: Reject oversized files before reading into a JS string.
+  // file.text() on a 100 MB file blocks the UI thread for several seconds.
+  if (file.size > MAX_READ_SIZE_BYTES) {
+    throw new Error(
+      `"${name}" is too large to read (${(file.size / 1024 / 1024).toFixed(1)} MB — max 2 MB). ` +
+      `Only markdown context files should live in the reminisce/ folder.`
+    )
+  }
+  return await file.text()
 }
 
 export async function writeFile(
@@ -86,8 +124,19 @@ export async function writeFile(
   const name = slash === -1 ? path : path.slice(slash + 1)
   const fh = await dirHandle.getFileHandle(name, { create: true })
   const writable = await fh.createWritable()
-  await writable.write(content)
-  await writable.close()
+  // FS-1: createWritable() truncates the file to 0 bytes immediately
+  // (keepExistingData defaults to false). If write() throws — disk full,
+  // permission revoked mid-write, etc — the previous content is already
+  // gone. abort() discards the incomplete write and closes the stream
+  // safely. Without it the writable is abandoned open and the file is
+  // left as an empty 0-byte stub.
+  try {
+    await writable.write(content)
+    await writable.close()
+  } catch (err) {
+    try { await writable.abort() } catch { /* abort may itself throw if stream already closed */ }
+    throw err
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -105,6 +154,10 @@ export async function readGitBranch(
     //   "<sha>\n"                  (detached HEAD)
     const raw = await readFile(handle, '.git/HEAD')
     const trimmed = raw.trim()
+    // FS-11: Guard against an empty HEAD file (e.g. mid-clone, or a corrupted
+    // repo). Without this, an empty string would fall through to the SHA branch
+    // and return ' (detached)' with a leading space and an 8-char empty string.
+    if (!trimmed) return null
     if (trimmed.startsWith('ref: refs/heads/')) {
       return trimmed.replace('ref: refs/heads/', '')
     }
@@ -118,9 +171,23 @@ export async function readGitBranch(
 export async function readGitLastCommit(
   handle: FileSystemDirectoryHandle,
 ): Promise<string | null> {
+  // CE-15: Prefer .git/logs/HEAD — updated by every commit, pull, merge, and
+  // rebase, whereas COMMIT_EDITMSG is only written when the user types a commit
+  // message (not on pull/merge/rebase).  Each line ends with \t<message>.
   try {
-    // .git/COMMIT_EDITMSG contains the last commit message.
-    // Take the first non-empty, non-comment line only.
+    const raw = await readFile(handle, '.git/logs/HEAD')
+    const lines = raw.split('\n').filter(l => l.trim().length > 0)
+    const last = lines[lines.length - 1]
+    if (last) {
+      const tabIdx = last.indexOf('\t')
+      if (tabIdx !== -1) return last.slice(tabIdx + 1).trim() || null
+    }
+  } catch {
+    // logs/HEAD missing (shallow clone, very old git, or not a git repo) —
+    // fall back to COMMIT_EDITMSG.
+  }
+  try {
+    // Fallback: .git/COMMIT_EDITMSG — take the first meaningful line.
     const raw = await readFile(handle, '.git/COMMIT_EDITMSG')
     const line = raw
       .split('\n')
@@ -215,6 +282,25 @@ export const DEVELOPER_OWNED_PATHS = [
   'reminisce/logs/changes.md',
 ] as const
 
+// FS-13: Per-read timeout to prevent a single stalled File System Access API
+// call from hanging the entire readAllContextFiles batch indefinitely.
+// Chrome's FS API can stall (e.g. on a network drive) without ever throwing.
+// 8 seconds is generous for any local file read; callers get partial results
+// for files that do respond.
+const READ_TIMEOUT_MS = 8_000
+
+function withReadTimeout(promise: Promise<string>, label: string): Promise<string> {
+  return Promise.race([
+    promise,
+    new Promise<string>((_, reject) =>
+      setTimeout(
+        () => reject(new Error(`Read timed out after ${READ_TIMEOUT_MS / 1000}s: ${label}`)),
+        READ_TIMEOUT_MS,
+      )
+    ),
+  ])
+}
+
 export async function readAllContextFiles(
   handle: FileSystemDirectoryHandle,
   paths: readonly string[] = REMINISCE_OWNED_PATHS,
@@ -223,10 +309,12 @@ export async function readAllContextFiles(
   await Promise.allSettled(
     paths.map(async (path) => {
       try {
-        const content = await readFile(handle, path)
+        // FS-13: Race each read against a timeout so a single stalled call
+        // cannot block the batch forever.
+        const content = await withReadTimeout(readFile(handle, path), path)
         if (content.trim().length > 0) results[path] = content
       } catch {
-        // File doesn't exist yet — skip silently
+        // File doesn't exist, timed out, or is unreadable — skip silently.
       }
     }),
   )
@@ -262,9 +350,25 @@ const LOG_PLACEHOLDERS: Record<string, string> = {
 export async function initProjectStructure(
   handle: FileSystemDirectoryHandle,
 ): Promise<void> {
-  // 1. Create all required directories
+  // 1. Create all required directories.
+  // FS-12: Collect per-directory failures rather than throwing on the first one.
+  // A single failure (e.g. permission error on one sub-path) previously aborted
+  // the entire init, leaving the structure half-created with no indication of
+  // which directories were missing. Now we surface all failures in one message.
+  const dirErrors: string[] = []
   for (const dir of REMINISCE_DIRS) {
-    await getDirHandle(handle, dir, true)
+    try {
+      await getDirHandle(handle, dir, true)
+    } catch {
+      dirErrors.push(dir)
+    }
+  }
+  if (dirErrors.length > 0) {
+    const s = dirErrors.length > 1 ? 'ies' : 'y'
+    throw new Error(
+      `Could not create ${dirErrors.length} director${s}: ${dirErrors.join(', ')}. ` +
+      `Check that the folder is writable and try again.`
+    )
   }
 
   // 2. Create log placeholder files only if they don't already exist
@@ -291,19 +395,42 @@ export type FileTree = {
   children?: FileTree[]
 }
 
+// FS-7: Cap entries per directory level to prevent browser freeze on
+// directories with thousands of files (e.g. node_modules/.cache/).
+// The depth guard (CE-14) only limits recursion depth, not breadth.
+const MAX_ENTRIES_PER_DIR = 500
+
 export async function scanDirectory(
   handle: FileSystemDirectoryHandle,
   path = '',
+  // CE-14: depth guard — prevents stack overflow on deeply nested folder trees
+  // (e.g. node_modules or generated output inside the project root).
+  depth = 0,
 ): Promise<FileTree[]> {
+  // Hard cap: anything deeper than 10 levels cannot be a reminisce/ context
+  // file and would risk blowing the call stack on adversarial inputs.
+  if (depth > 10) return []
+
   const tree: FileTree[] = []
+  let count = 0
   for await (const entry of handle.values()) {
+    // FS-7: Bail out if this directory is abnormally large (e.g. node_modules).
+    // Push a sentinel entry so the UI can show a truncation warning.
+    if (++count > MAX_ENTRIES_PER_DIR) {
+      tree.push({
+        name: `… (${MAX_ENTRIES_PER_DIR}+ entries, truncated)`,
+        kind: 'file',
+        path: path ? `${path}/…` : '…',
+      })
+      break
+    }
     const entryPath = path ? `${path}/${entry.name}` : entry.name
     if (entry.kind === 'directory') {
       tree.push({
         name: entry.name,
         kind: 'directory',
         path: entryPath,
-        children: await scanDirectory(entry, entryPath),
+        children: await scanDirectory(entry, entryPath, depth + 1),
       })
     } else {
       tree.push({ name: entry.name, kind: 'file', path: entryPath })

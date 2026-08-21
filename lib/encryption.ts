@@ -31,7 +31,10 @@ export function encrypt(text: string): string {
 export function decrypt(encryptedText: string): string {
   if (!encryptedText) return encryptedText
 
-  const text  = Buffer.from(encryptedText, 'base64').toString('ascii')
+  // ENC-1: Use 'latin1' (binary-safe, 1:1 byte mapping) not 'ascii' (strips
+  // high bytes ≥ 0x80), which would corrupt the hex-encoded IV / authTag on
+  // any key that hashes to bytes outside the printable ASCII range.
+  const text  = Buffer.from(encryptedText, 'base64').toString('latin1')
   const parts = text.split(':')
   if (parts.length !== 3) throw new Error('Invalid encrypted text format')
 

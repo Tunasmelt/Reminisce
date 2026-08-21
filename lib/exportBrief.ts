@@ -1,8 +1,6 @@
 export interface BriefData {
   project: {
     name: string
-    type?: string
-    cluster?: string
     created_at?: string
   }
   phases: Array<{
@@ -49,16 +47,6 @@ export function generateMarkdown(
   // Overview table
   lines.push(`## Overview`)
   lines.push(``)
-  if (data.project.type) {
-    lines.push(
-      `**Type:** ${data.project.type}`
-    )
-  }
-  if (data.project.cluster) {
-    lines.push(
-      `**Cluster:** ${data.project.cluster}`
-    )
-  }
   lines.push(
     `**Phases:** ${data.phases.length}`
   )
