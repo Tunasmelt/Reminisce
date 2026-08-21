@@ -22,19 +22,33 @@ function hexToRgba(hex: string, a: number) {
   return `rgba(${r},${g},${b},${a})`
 }
 
+// AU-9: Score based on length AND character diversity — not just length.
+// A 14-char all-lowercase password no longer shows "Strong".
+function scorePassword(password: string): number {
+  if (password.length === 0) return 0
+  if (password.length < 8)   return 1  // always "Too short" below minimum
+  let score = 1
+  if (password.length >= 12) score++
+  if (/[A-Z]/.test(password)) score++
+  if (/[0-9]/.test(password)) score++
+  if (/[^A-Za-z0-9]/.test(password)) score++
+  // Cap at 4 and floor at 1 so we always have a visible indicator
+  return Math.min(4, score)
+}
+
 function PasswordStrength({ password }: { password: string }) {
-  const strength = password.length === 0 ? 0 : password.length < 6 ? 1 : password.length < 10 ? 2 : password.length < 14 ? 3 : 4
-  const colors = ['transparent','#f87171','#f59e0b','#60a5fa','#34d399']
-  const labels = ['','Too short','Weak','Good','Strong']
+  const strength = scorePassword(password)
+  const colors = ['transparent', '#f87171', '#f59e0b', '#60a5fa', '#34d399']
+  const labels = ['', 'Too short', 'Weak', 'Fair', 'Strong']
   return (
-    <div style={{ marginTop:8 }}>
-      <div style={{ display:'flex', gap:4, marginBottom:6 }}>
-        {[1,2,3,4].map(i => (
-          <div key={i} style={{ flex:1, height:3, borderRadius:999, background: i<=strength ? colors[strength] : 'rgba(255,255,255,0.08)', transition:'background .3s' }}/>
+    <div style={{ marginTop: 8 }}>
+      <div style={{ display: 'flex', gap: 4, marginBottom: 6 }}>
+        {[1, 2, 3, 4].map(i => (
+          <div key={i} style={{ flex: 1, height: 3, borderRadius: 999, background: i <= strength ? colors[strength] : 'rgba(255,255,255,0.08)', transition: 'background .3s' }}/>
         ))}
       </div>
       {password.length > 0 && (
-        <span style={{ fontSize:10, fontWeight:600, color: colors[strength] }}>{labels[strength]}</span>
+        <span style={{ fontSize: 10, fontWeight: 600, color: colors[strength] }}>{labels[strength]}</span>
       )}
     </div>
   )
@@ -66,13 +80,25 @@ export default function SignupPage() {
     if (password.length < 8) { toast.error('Password must be at least 8 characters'); return }
     setLoading(true)
     try {
-      const { error } = await supabase.auth.signUp({
+      const { data: signUpData, error } = await supabase.auth.signUp({
         email, password,
         options: { data: { full_name: fullName } },
       })
       if (error) throw error
-      toast.success('Account created! Check your email to verify.')
-      router.push('/dashboard')
+
+      // AU-2: If Supabase requires email confirmation, signUp() returns a user
+      // but NO session. Pushing to /dashboard in that state causes ProtectedRoute
+      // to immediately bounce back to /login — a confusing redirect loop.
+      // Check whether a session was established before deciding where to go.
+      if (signUpData.session) {
+        // Email confirmations are disabled — user is fully signed in immediately.
+        toast.success('Account created! Welcome to Reminisce.')
+        router.push('/dashboard')
+      } else {
+        // Confirmation email sent — stay on a holding page; do NOT push /dashboard.
+        toast.success('Account created! Check your email to verify your address.')
+        router.push('/login?message=check-email')
+      }
     } catch(err) {
       toast.error(err instanceof Error ? err.message : 'Sign up failed')
     } finally { setLoading(false) }
@@ -155,7 +181,9 @@ export default function SignupPage() {
             <p style={{ fontSize:14, color:'rgba(255,255,255,0.4)' }}>Free plan — no credit card required</p>
           </div>
 
-          <div style={{ display:'flex', flexDirection:'column', gap:14 }}>
+          {/* AU-10: <form> wrapper for screen reader semantics, password-manager
+               autofill, and native Enter-key submission from any focused field. */}
+          <form onSubmit={handleSubmit} style={{ display:'flex', flexDirection:'column', gap:14 }}>
             {/* Name */}
             <div>
               <label style={{ display:'block', fontSize:10, fontWeight:800, letterSpacing:'0.12em', textTransform:'uppercase' as const, color:'rgba(255,255,255,0.35)', marginBottom:8 }}>Full name</label>
@@ -199,11 +227,11 @@ export default function SignupPage() {
               )}
             </div>
 
-            {/* Submit */}
-            <button onClick={()=>handleSubmit()} disabled={loading} style={{ width:'100%', padding:'15px', background:ac, color:'#000', border:'none', borderRadius:14, fontSize:14, fontWeight:800, cursor: loading?'not-allowed':'pointer', opacity: loading?0.7:1, boxShadow:`0 0 32px ${hexToRgba(ac,0.35)}`, display:'flex', alignItems:'center', justifyContent:'center', gap:8, marginTop:4 }}>
+            {/* Submit — type="submit" so native form Enter and submit events work */}
+            <button type="submit" disabled={loading} style={{ width:'100%', padding:'15px', background:ac, color:'#000', border:'none', borderRadius:14, fontSize:14, fontWeight:800, cursor: loading?'not-allowed':'pointer', opacity: loading?0.7:1, boxShadow:`0 0 32px ${hexToRgba(ac,0.35)}`, display:'flex', alignItems:'center', justifyContent:'center', gap:8, marginTop:4 }}>
               {loading ? 'Creating account…' : <><span>Create free account</span><ArrowRight size={15}/></>}
             </button>
-          </div>
+          </form>
 
           <div style={{ textAlign:'center', marginTop:24 }}>
             <p style={{ fontSize:13, color:'rgba(255,255,255,0.35)' }}>

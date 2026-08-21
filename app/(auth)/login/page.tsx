@@ -44,14 +44,30 @@ export default function LoginPage() {
     if (!email || !password) { toast.error('Please fill in all fields'); return }
     setLoading(true)
     try {
-      const { error } = await supabase.auth.signInWithPassword({ email, password })
+      // AU-7: Trim email before submission — a trailing space produces a
+      // misleading "Invalid login credentials" instead of "Invalid email".
+      const { error } = await supabase.auth.signInWithPassword({ email: email.trim(), password })
       if (error) throw error
-      router.push('/dashboard')
+
+      const params = new URLSearchParams(window.location.search)
+      const redirectTo = params.get('redirect')
+      // AU-1: Guard against protocol-relative URLs (//evil.com) which start
+      // with '/' but are cross-origin. Require the path to start with '/'
+      // and NOT start with '//' to prevent open redirect attacks.
+      if (redirectTo && redirectTo.startsWith('/') && !redirectTo.startsWith('//')) {
+        router.push(redirectTo)
+      } else {
+        router.push('/dashboard')
+      }
     } catch(err) {
       toast.error(err instanceof Error ? err.message : 'Sign in failed')
     } finally { setLoading(false) }
   }
 
+  // AU-13: Keep individual onKeyDown handlers for legacy compatibility, but
+  // the <form onSubmit> added below (AU-10) is the primary Enter-key handler —
+  // it covers every focusable element inside the form, including the show/hide
+  // eye button which the input-level handler couldn't reach.
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter') handleSubmit()
   }
@@ -128,8 +144,11 @@ export default function LoginPage() {
             <p style={{ fontSize:14, color:'rgba(255,255,255,0.4)', lineHeight:1.6 }}>Sign in to your project workspace</p>
           </div>
 
-          {/* Form */}
-          <div style={{ display:'flex', flexDirection:'column', gap:14 }}>
+          {/* Form — AU-10: <form> wrapper gives screen readers form semantics,
+               enables browser password-manager autofill detection, and lets
+               the native submit event handle Enter from any focused element
+               (AU-13), so we don't need per-input onKeyDown handlers. */}
+          <form onSubmit={handleSubmit} style={{ display:'flex', flexDirection:'column', gap:14 }}>
             {/* Email */}
             <div>
               <label style={{ display:'block', fontSize:10, fontWeight:800, letterSpacing:'0.12em', textTransform:'uppercase' as const, color:'rgba(255,255,255,0.35)', marginBottom:8 }}>Email</label>
@@ -163,11 +182,11 @@ export default function LoginPage() {
               </div>
             </div>
 
-            {/* Submit */}
-            <button onClick={()=>handleSubmit()} disabled={loading} style={{ width:'100%', padding:'15px', background:ac, color:'#000', border:'none', borderRadius:14, fontSize:14, fontWeight:800, cursor: loading?'not-allowed':'pointer', opacity: loading?0.7:1, boxShadow:`0 0 32px ${hexToRgba(ac,0.35)}`, display:'flex', alignItems:'center', justifyContent:'center', gap:8, marginTop:4 }}>
+            {/* Submit — type="submit" so native form Enter and submit events work */}
+            <button type="submit" disabled={loading} style={{ width:'100%', padding:'15px', background:ac, color:'#000', border:'none', borderRadius:14, fontSize:14, fontWeight:800, cursor: loading?'not-allowed':'pointer', opacity: loading?0.7:1, boxShadow:`0 0 32px ${hexToRgba(ac,0.35)}`, display:'flex', alignItems:'center', justifyContent:'center', gap:8, marginTop:4 }}>
               {loading ? 'Signing in…' : <><span>Sign in</span><ArrowRight size={15}/></>}
             </button>
-          </div>
+          </form>
 
           {/* Footer links */}
           <div style={{ textAlign:'center', marginTop:28 }}>
