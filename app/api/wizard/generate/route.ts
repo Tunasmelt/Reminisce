@@ -1,8 +1,10 @@
 import { NextResponse } from 'next/server'
 import { getServiceSupabase, supabase as clientSupabase, verifyProjectAccess, getProjectRole } from '@/lib/supabase'
-import { callAI } from '@/lib/ai-client'
-import { awardCoins, deductCost, refundCost, getModelCostInfo } from '@/lib/wallet'
+import { callAI, userHasOwnKey } from '@/lib/ai-client'
+import { awardCoins, deductCost, refundCost, getModelCostInfo, getUserPlan } from '@/lib/wallet'
 import type { AIProvider } from '@/lib/ai-client'
+import { getModel } from '@/lib/model-registry'
+import { canUseModel } from '@/lib/model-permissions'
 import {
   buildGenerationPrompts,
   classifyError,
@@ -295,6 +297,13 @@ export async function POST(req: Request) {
       .eq('id', sessionId)
   }
 
+  // ── User plan (fetched ONCE for the whole generation) ─────────────────────
+  // The plan can't change mid-request, so every step's permission gate reuses
+  // this rather than re-querying per step. Declared here in POST scope so the
+  // runStep() closure (defined below, invoked in the parallel waves at ~544/591)
+  // can read it.
+  const userPlan = await getUserPlan(uid)
+
   // ── Helpers ───────────────────────────────────────────────────────────────
   const encoder = new TextEncoder()
 
@@ -353,6 +362,35 @@ export async function POST(req: Request) {
     const stepProvider = (prompt.lightModel?.provider ?? provider) as AIProvider
     const stepModel    = prompt.lightModel?.model ?? model
     const stepRunId    = `wizard-gen-${sessionId}-step${prompt.step}-${Date.now()}`
+
+    // ── Per-step model permission gate (A2) — BEFORE any charge ───────────────
+    // Gate THIS step's actual model (lightModel override on steps 2-4, or the
+    // top-level user-selected model on steps 0-1). isBYOK is resolved per-step
+    // because different steps can use different providers. A rejection is routed
+    // through the SAME step_error/fatal machinery every other failure in runStep
+    // uses (prompt.step <= 1 is fatal) — not a bare throw, not a silent null.
+    //
+    // This also closes a pre-existing tier-enforcement gap: deductCost's own
+    // tier check on the next line is fire-and-forget (its result is discarded),
+    // so a free-tier user's Pro model was never actually blocked here.
+    {
+      const stepIsBYOK   = await userHasOwnKey(uid, stepProvider)
+      const stepModelDef = await getModel(stepProvider, stepModel)
+      const perm = canUseModel({ plan: userPlan.plan, isBYOK: stepIsBYOK }, stepModelDef)
+      if (!perm.ok) {
+        const isFatal = prompt.step <= 1
+        controller.enqueue(sseEvent({
+          type: 'step_error', step: prompt.step, label: prompt.label,
+          error: perm.reason, errorType: 'permission_denied',
+          action: 'change_model', fatal: isFatal, resumeStep: prompt.step,
+        }))
+        if (isFatal) {
+          throw new Error(`Fatal step ${prompt.step}: ${perm.reason}`)
+        }
+        await supabase.from('wizard_sessions').update({ generation_status: 'partial' }).eq('id', sessionId)
+        return null
+      }
+    }
 
     try { await deductCost(uid, stepModel, stepRunId) } catch { /* non-fatal */ }
 
