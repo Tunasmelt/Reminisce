@@ -2,7 +2,9 @@ import { NextResponse } from 'next/server'
 import { getServiceSupabase, supabase as clientSupabase, verifyProjectAccess, getProjectRole } from '@/lib/supabase'
 import { callAI, userHasOwnKey } from '@/lib/ai-client'
 import type { AIProvider } from '@/lib/ai-client'
-import { deductCost, refundCost, ensureWallet } from '@/lib/wallet'
+import { deductCost, refundCost, ensureWallet, getUserPlan } from '@/lib/wallet'
+import { getModel } from '@/lib/model-registry'
+import { canUseModel } from '@/lib/model-permissions'
 
 export const dynamic = 'force-dynamic'
 
@@ -370,6 +372,20 @@ export async function POST(req: Request) {
 
     // ── BYOK check ───────────────────────────────────────────────────────
     const isBYOK = await userHasOwnKey(user.id, provider as AIProvider)
+
+    // ── Model permission gate (A2) ────────────────────────────────────────
+    // Enforce enabled + tier BEFORE any charge, via the shared resolver (the
+    // same gate agent/run uses). Applies to BYOK users too — a disabled model is
+    // rejected for everyone; BYOK bypasses only tier gating. Plain-JSON response
+    // matches this route's other pre-flight failures (e.g. the 402 balance path).
+    {
+      const modelDef = await getModel(provider, model)
+      const userPlan = await getUserPlan(user.id)
+      const perm = canUseModel({ plan: userPlan.plan, isBYOK }, modelDef)
+      if (!perm.ok) {
+        return NextResponse.json({ error: perm.reason }, { status: perm.status })
+      }
+    }
 
     if (!isBYOK) {
       // P-6: Wrap deductCost so a DB failure mid-deduction returns a clear
