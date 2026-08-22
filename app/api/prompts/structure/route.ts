@@ -1,7 +1,9 @@
 import { NextResponse } from 'next/server'
 import { getServiceSupabase, supabase as clientSupabase, verifyProjectAccess, isUserBanned, getProjectRole } from '@/lib/supabase'
-import { callAI } from '@/lib/ai-client'
-import { deductCost, refundCost, ensureWallet } from '@/lib/wallet'
+import { callAI, userHasOwnKey } from '@/lib/ai-client'
+import { deductCost, refundCost, ensureWallet, getUserPlan } from '@/lib/wallet'
+import { getModel } from '@/lib/model-registry'
+import { canUseModel } from '@/lib/model-permissions'
 
 export const dynamic = 'force-dynamic'
 
@@ -110,6 +112,21 @@ ${govContent.substring(0, 300)}
 EXPECTED OUTPUT
 ${expectedOutput}
 `.trim()
+
+    // ── Model permission gate (A2) ────────────────────────────────────────
+    // Enforce enabled + tier BEFORE any charge, via the shared resolver (same
+    // gate agent/run uses). This route has no BYOK economy bypass, but we still
+    // compute isBYOK so a BYOK user isn't wrongly tier-blocked. Runs before
+    // ensureWallet/deductCost — no scenario where a coin is charged then rejected.
+    const isBYOK = await userHasOwnKey(user.id, provider)
+    {
+      const modelDef = await getModel(provider, model)
+      const userPlan = await getUserPlan(user.id)
+      const perm = canUseModel({ plan: userPlan.plan, isBYOK }, modelDef)
+      if (!perm.ok) {
+        return NextResponse.json({ error: perm.reason }, { status: perm.status })
+      }
+    }
 
     // PS-1: deduct cost before AI call — this endpoint was previously a free
     // AI call; now it follows the standard deduct-before-call / refund-on-error
