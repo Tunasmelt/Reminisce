@@ -1,5 +1,10 @@
 import { NextResponse } from 'next/server'
 import { supabase as clientSupabase, isUserBanned } from '@/lib/supabase'
+import { isBlockedHost, resolveAndValidateHost, createPinnedAgent } from '@/lib/ssrf-guard'
+// Use undici's OWN fetch (not Node's global fetch): a dispatcher from the undici
+// package is only accepted by that same package's fetch — Node's global fetch,
+// backed by its bundled undici, rejects it with UND_ERR_INVALID_ARG.
+import { fetch, type Agent } from 'undici'
 
 export const dynamic = 'force-dynamic'
 
@@ -7,6 +12,9 @@ export const dynamic = 'force-dynamic'
 const MAX_RESPONSE_BYTES = 5 * 1024 * 1024
 
 export async function POST(req: Request) {
+  // Single-use, DNS-pinned dispatcher (Fix 4). Declared here so the finally
+  // below can close it regardless of which return/throw path is taken.
+  let pinnedAgent: Agent | undefined
   try {
     const authHeader = req.headers.get('authorization')
     if (!authHeader) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
@@ -57,35 +65,26 @@ export async function POST(req: Request) {
     }
 
     const hostname = parsedUrl.hostname.toLowerCase()
-    const blockedPatterns = [
-      /^localhost$/,
-      /^127\./,
-      /^10\./,
-      /^172\.(1[6-9]|2\d|3[01])\./,
-      /^192\.168\./,
-      /^169\.254\./,  // link-local / AWS metadata service
-      /^::1$/,        // IPv6 loopback
-      /^0\.0\.0\.0$/,
-      /\.internal$/,
-      /\.local$/,
-      // PX-4: IPv6-mapped IPv4 addresses (e.g. ::ffff:127.0.0.1) bypass the
-      // IPv4 checks above because the hostname looks like an IPv6 address.
-      // Block the ::ffff: prefix in all its representations.
-      /^::ffff:/i,
-      /^0{0,4}:0{0,4}:0{0,4}:0{0,4}:0{0,4}:ffff:/i,
-      /^\[::ffff:/i,  // bracket-quoted form some clients emit
-      // PX-7: Alternative IPv4 encodings that bypass the dotted-decimal
-      // patterns above — all resolve to the same (often internal) addresses:
-      //   decimal integer  http://2130706433        → 127.0.0.1
-      //   hex              http://0x7f000001         → 127.0.0.1
-      //   octal/hex octets http://0177.0.0.1, 0x7f.. → 127.0.0.1
-      /^\d+$/,             // bare decimal integer host
-      /(^|\.)0x[0-9a-f]+/i, // hex octet (or whole-host hex)
-      /(^|\.)0\d+/,        // octal octet (leading-zero numeric label)
-    ]
-    if (blockedPatterns.some(p => p.test(hostname))) {
+
+    // Layer 1 — string check on the hostname text. The full pattern list now
+    // lives in lib/ssrf-guard as the single source of truth (shared with the
+    // resolved-IP check below): loopback/RFC-1918/link-local/cloud-metadata,
+    // IPv6-mapped IPv4, and the alternative IPv4 encodings (decimal/hex/octal).
+    if (isBlockedHost(hostname)) {
       return NextResponse.json({ error: 'Private/internal URLs are not allowed' }, { status: 400 })
     }
+
+    // Layer 2 (Fix 4) — DNS-rebinding guard. The string check only inspects the
+    // hostname text; a public name that resolves to a private IP (127.0.0.1,
+    // 169.254.169.254, …) would still pass it. Resolve the host, reject if ANY
+    // resolved address is private, then pin the connection to a validated IP via
+    // an undici dispatcher so the actual TCP target can't differ from what we
+    // checked (closes the check-then-rebind window).
+    const validation = await resolveAndValidateHost(hostname)
+    if (!validation.ok) {
+      return NextResponse.json({ error: 'Private/internal URLs are not allowed' }, { status: 400 })
+    }
+    pinnedAgent = createPinnedAgent(validation.pinnedIp, validation.family)
 
     const fetchHeaders: Record<string, string> = { ...(headers ?? {}) }
 
@@ -104,11 +103,15 @@ export async function POST(req: Request) {
       // SSRF blocklist above because the check only runs on the original URL.
       // With redirect:'error', fetch throws on any redirect and we return a
       // clean error to the client instead of following the redirect chain.
+      // dispatcher pins the TCP connection to the validated IP (Fix 4).
+      // Everything below the fetch (streaming, 5 MB cap, SAFE_RESPONSE_HEADERS)
+      // is unchanged — undici's Response is WHATWG-compatible.
       const response = await fetch(url, {
         method: safeMethod,
         headers: fetchHeaders,
         body: safeMethod !== 'GET' && safeMethod !== 'HEAD' ? reqBody : undefined,
         redirect: 'error',
+        dispatcher: pinnedAgent,
       })
 
       ttfb = Date.now() - start
@@ -187,5 +190,9 @@ export async function POST(req: Request) {
   } catch (error: unknown) {
     console.error('[proxy] error:', error)
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
+  } finally {
+    // Close the single-use pinned Agent so its keep-alive socket doesn't linger
+    // after the response has been fully read. Best-effort — never mask the result.
+    if (pinnedAgent) { try { await pinnedAgent.close() } catch { /* ignore */ } }
   }
 }
