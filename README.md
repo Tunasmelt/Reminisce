@@ -124,7 +124,7 @@ Open [http://localhost:3000](http://localhost:3000).
 
 ```
 app/
-├── api/                        # 36 API routes, all force-dynamic
+├── api/                        # 45 API routes, all force-dynamic
 │   ├── admin/                  # Admin panel (verifyAdmin gated)
 │   ├── agent/                  # AI agent runs (streaming SSE)
 │   ├── context/                # Context versioning + history
@@ -180,10 +180,10 @@ BYOK (Bring Your Own Key) bypasses the economy entirely.
 - PAM threads protected by `verifyThreadOwnership`
 - Banned user checks on AI-consuming routes
 - BYOK keys encrypted with AES-256-GCM using `ENCRYPTION_SECRET`
-- Admin routes double-gated (middleware cookie check + DB `is_admin` flag)
+- Admin routes gated by a DB `is_admin` check in `app/admin/layout.tsx`; `middleware.ts` is intentionally a no-op (Supabase cookie names vary by project ref, so admin can't be checked at the edge)
 - Stripe webhook validated with `constructEvent` signature check
-- SSRF protection in API Lab proxy (blocks private IP ranges + metadata endpoints)
-- Row Level Security enabled on all 26 tables
+- SSRF protection in the API Lab proxy — two layers: a hostname blocklist (private ranges + metadata endpoints) plus resolve-then-pin against DNS rebinding
+- Row Level Security enabled on all 28 tables
 
 ---
 

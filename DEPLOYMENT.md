@@ -11,33 +11,23 @@
 
 ## Step 1 — Prepare the database
 
-Run all migrations in your Supabase SQL Editor **in this exact order**:
+Run the **canonical reset script** in your Supabase SQL Editor — this single file is a complete cold install (schema, RLS, functions/RPCs, and the seed model catalogue):
 
-1. `00000000000000_core_schema.sql`
-2. `00000000000001_economy_and_wallet.sql`
-3. `00000000000002_graph_and_board.sql`
-4. *(skip 00000000000004 — placeholder)*
-5. `00000000000005_pam_threads.sql`
-6. `00000000000006_pam_phase2_and_prompts.sql`
-7. `00000000000007_project_reminders.sql`
-8. `00000000000008_context_sync_and_git.sql`
-9. `00000000000009_admin_and_models.sql`
-10. `00000000000010_missing_columns_and_templates.sql`
-11. `00000000000011_admin_logs_columns.sql`
+```
+supabase/migrations/00000000000099_complete_reset_schema.sql
+```
 
-After running, verify:
+**No other migration files are required for a fresh install** — migrations `0035`–`0038` are already folded into this script. _Optional:_ afterward run `supabase/migrations/0000000000039_models_rehaul.sql` to refresh the model catalogue to the current verified-live set (model data only, no schema). The older per-migration files live in `supabase/migrations/archive/` for history and are **not** run on a fresh install.
+
+After running, verify the schema landed:
 ```sql
-SELECT COUNT(*) FROM information_schema.columns
-WHERE table_schema = 'public'
-  AND (
-    (table_name = 'user_wallets'    AND column_name = 'gems_last_granted')  OR
-    (table_name = 'user_plans'      AND column_name IN ('is_admin','banned_at')) OR
-    (table_name = 'provider_models' AND column_name IN ('enabled','tier_required')) OR
-    (table_name = 'contexts'        AND column_name IN ('file_hash','owned_by')) OR
-    (table_name = 'agent_runs'      AND column_name = 'model_used') OR
-    (table_name = 'admin_logs'      AND column_name IN ('target_id','target_type'))
-  );
--- Expected: 10 rows
+SELECT count(*) AS tables
+  FROM information_schema.tables
+ WHERE table_schema = 'public' AND table_type = 'BASE TABLE';
+-- Expected: 28
+
+SELECT count(*) AS models FROM public.provider_models;
+-- Expected: > 0 (seeded)
 ```
 
 Set your admin account:
@@ -224,7 +214,7 @@ git push origin main
 |---|---|---|
 | Login redirect fails | Auth URL not updated | Set Site URL in Supabase Auth settings |
 | Stripe webhook 400 | Wrong `STRIPE_WEBHOOK_SECRET` | Re-copy signing secret from Stripe |
-| AI models not loading | `provider_models` table empty | Re-run migration 0 seed section |
+| AI models not loading | `provider_models` table empty | Re-run `00000000000099` (or `0000000000039` for the verified-live catalogue) |
 | Admin panel 403 | `is_admin` not set | Run the UPDATE SQL in Step 1 |
-| Coins not resetting | `handle_new_user` trigger not created | Re-run migration 1 |
+| Coins not resetting | `handle_new_user` trigger not created | Re-run `00000000000099` (it defines the trigger) |
 | Build fails on Vercel | Missing env var | Check all required vars are set |
