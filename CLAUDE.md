@@ -172,7 +172,7 @@ Under `app/dashboard/projects/[id]/`:
 ### 5.9 Proxy — `/api/proxy`
 | Method + Path | Purpose |
 |---|---|
-| POST `/proxy` | SSRF-protected HTTP proxy powering API Lab. Blocks private IP ranges, localhost, `.local`, `.internal`, AWS/GCP metadata endpoints. Supports Bearer + `x-api-key` auth. Returns `{ status, headers, body, timing:{total,ttfb}, size }`. |
+| POST `/proxy` | SSRF-hardened HTTP proxy powering API Lab. **Two-layer defense** (`lib/ssrf-guard.ts`): hostname blocklist **+** DNS-rebinding guard that resolves the host, rejects any private-resolving IP, and pins the connection to a validated IP via an undici dispatcher. `redirect:'error'`, 5 MB response cap, safe response-header allowlist. Supports Bearer + `x-api-key` auth. Returns `{ status, headers, body, timing:{total,ttfb}, size }`. |
 
 ### 5.10 Rewards — `/api/rewards/daily-login`
 POST → `awardCoins(..., 'daily_login')`.
@@ -221,8 +221,14 @@ Each module is self-contained with typed exports. Prefer composing these in rout
 
 | File | Responsibility | Key exports |
 |---|---|---|
-| `ai-client.ts` (27.5 KB) | Unified client for all 10 AI providers. Rate limiting per model. BYOK resolution. | `AIProvider`, `getAIClient()`, `streamToCompletion()`, `checkUserRateLimit()` |
-| `wallet.ts` (15.4 KB) | Dual-currency economy. | `MODEL_COSTS`, `getUserPlan()`, `canCreateProject()`, `getWallet()`, `deductCoins()`, `awardCoins()`, `refundCoins()`, `dailyResetCoins()`, `ensureWallet()` |
+| `ai-client.ts` | Unified client for all 10 AI providers. Per-model rate limiting (via `rate_events`). BYOK key resolution. | `AIProvider`, `callAI()`, `userHasOwnKey()`, `invalidateModelCache()` |
+| `wallet.ts` | Dual-currency economy + per-model cost/tier lookup. | `getModelCostInfo()`, `getUserPlan()`, `canCreateProject()`, `getWallet()`, `ensureWallet()`, `applyDailyReset()`, `deductCost()`, `refundCost()`, `awardCoins()`, `getTimeUntilUTCReset()` |
+| `model-registry.ts` | Single cached reader of `provider_models` — the one source of truth in code for model metadata. | `ModelDef`, `getModels()`, `getModel()`, `getModelByIdLoose()`, `invalidate()` |
+| `model-permissions.ts` | Pure resolver: may this user run this model? (enabled + tier + BYOK). No I/O. | `canUseModel()`, `ModelPermissionContext`, `ModelPermissionResult` |
+| `ssrf-guard.ts` | Two-layer SSRF defense for `/api/proxy` (hostname blocklist + resolve-then-pin). | `isBlockedHost()`, `resolveAndValidateHost()`, `createPinnedAgent()`, `HostValidation` |
+| `admin-audit.ts` | Single canonical `admin_logs` writer — non-throwing, delete-safe. | `writeAuditLog()` |
+| `api-auth.ts` | Bearer-token auth helper (partial adoption — 3 routes: `agent/history`, `context/history`, `export`). | `authenticateRequest()` |
+| `constants.ts` | Shared constants. | `ALLOWED_PROVIDERS` (the 10 provider slugs) |
 | `wizard-stages.ts` (46.6 KB) | Wizard state machine + generation config. | `WizardStageKey`, `WizardSessionState`, `TechStackOption`, `ConfirmedFeature`, `STAGE_META`, `GENERATION_STEPS` |
 | `fsapi.ts` (13.3 KB) | File System Access API + git reading. Handles persisted in IndexedDB. | `openProjectFolder()`, `getStoredHandle()`, `readFile()`, `writeFile()`, `initProjectStructure()`, `readGitState()`, `readAllContextFiles()`, `computeFileHash()`, `REMINISCE_OWNED_PATHS` |
 | `vector-memory.ts` (6 KB) | Embeddings + semantic search. | `chunkText()`, `generateEmbedding()`, `upsertMemoryChunks()`, `searchMemory()`, `indexProjectContext()` |
@@ -234,10 +240,10 @@ Each module is self-contained with typed exports. Prefer composing these in rout
 | `exportBrief.ts` (5.4 KB) | Project brief export. | `BriefData`, `generateMarkdown()`, `generatePlainText()`, `generateJSON()`, `downloadFile()`, `copyToClipboard()` |
 | `project-scanner.ts` | Static analysis engine for import feature. Parses manifests, Next.js routes, Express routes, DB schemas, .env.example. No AI. | `ScanResult`, `RawFeature`, `FileMap`, `buildScanResult()`, `parsePackageJson()`, `parseNextJsRoutes()`, `parseExpressRoutes()`, `parseDbModels()`, `detectAuthFeatures()`, `buildIntegrationFeatures()`, `detectTechStack()`, `parseGitHead()`, `parseGitLog()` |
 | `phase-grouper.ts` | Rules-based phase assignment for imported projects. Buckets `RawFeature[]` into ordered `ScannedPhase[]`. | `ScannedPhase`, `ScannedFeature`, `groupIntoPhases()` |
-| `utils.ts` | `cn()` — Tailwind class merger (clsx + twMerge). |
+| `utils.ts` | Shared UI helpers. | `cn()` (clsx + twMerge), `hexToRgba()` |
 
 ### 6.1 Supported AI providers
-Groq, Cerebras, SambaNova, Gemini, Mistral, Anthropic, OpenAI, Kimi (Moonshot), MiniMax, OpenRouter. Context-window limits range SambaNova 5.5K → Gemini 800K. Per-model RPM/RPD limits enforced in `checkUserRateLimit()` via the `wallet_transactions` table.
+Groq, Cerebras, SambaNova, Gemini, Mistral, Anthropic, OpenAI, Kimi (Moonshot), MiniMax, OpenRouter. Context-window limits range SambaNova 5.5K → Gemini 800K. Per-model RPM/RPD limits enforced in `checkUserRateLimit()` (in `ai-client.ts`) via the dedicated `rate_events` table (decoupled from the billing ledger).
 
 ### 6.2 Economy rules
 | Plan | Coins/day | Gems | Projects cap |
@@ -336,7 +342,7 @@ provider_models    (global, seeded)
 
 **Identity / economy.** `user_plans`, `user_wallets`, `wallet_transactions`, `gem_purchases`, `user_api_keys`.
 
-**Admin + catalog.** `admin_logs`, `provider_models` (seeded with 24 models across Groq / Cerebras / Gemini / Mistral / OpenRouter / Anthropic / OpenAI / Mistral).
+**Admin + catalog.** `admin_logs`, `provider_models`, `rate_events` (per-user AI rate-limit ledger). The verified catalogue is **32 live-checked models across 9 active providers** (Groq, Cerebras, SambaNova, OpenRouter, Gemini, Anthropic, Mistral, Kimi, MiniMax); **OpenAI is seeded but disabled** (invalid platform key). _Model management is `provider_models`-backed today; this whole flow is slated for replacement by `config/models.ts` in the **M2 model-config rehaul** — treat the specifics here as provisional, and re-pass this section once M2 lands._
 
 **Personal.** `prompt_templates` (per-user, category + tags + `use_count`).
 
@@ -357,8 +363,8 @@ provider_models    (global, seeded)
 - **Banned users** blocked from AI-consuming routes via `isUserBanned()`.
 - **BYOK keys** AES-256-GCM encrypted (`ENCRYPTION_SECRET` hashed to 256-bit key).
 - **Stripe webhook** signature-verified via `constructEvent`.
-- **SSRF protection** in `/api/proxy` — private IP ranges, `.local/.internal`, cloud metadata endpoints blocked.
-- **RLS** enabled on 23 of 24 tables (all except `provider_models` public read).
+- **SSRF protection** in `/api/proxy` — two layers via `lib/ssrf-guard.ts`: (1) hostname blocklist (private ranges, `.local`/`.internal`, cloud metadata, alternative IP encodings, IPv6 ULA/link-local); (2) a **DNS-rebinding guard** that resolves the host, rejects if any resolved IP is private, and **pins the connection to a validated IP** (undici dispatcher) so the TCP target can't rebind. Any future route that fetches a user-supplied URL must go through `resolveAndValidateHost()` + `createPinnedAgent()`.
+- **RLS** enabled on all 28 tables; `provider_models` additionally carries a public-read policy.
 
 ---
 
@@ -452,11 +458,18 @@ Full reference in `.env.example` (3.3 KB). Never commit `.env.local`.
 - **Canonical schema is `00000000000099_complete_reset_schema.sql`** — a complete cold install (migrations `0035`–`0038` are folded in; `0099` alone provisions a fresh DB). When adding new migrations, number them after the reset (current tail: `0000000000039`).
 - **If a cold install and an existing install diverge,** prefer idempotent `CREATE TABLE IF NOT EXISTS` / `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` in migrations.
 
+### AI-model access — the `canUseModel` gate
+Every AI-consuming route resolves the model + user context, then calls the single resolver **`canUseModel({ plan, isBYOK }, modelDef)`** from `lib/model-permissions.ts` **before any `deductCost`**: an unknown/disabled model → 400; a Pro-tier model on a free plan (non-BYOK) → 403; BYOK bypasses tier gating only. The `modelDef` comes from `getModel(provider, modelId)` in `lib/model-registry.ts` (the single `provider_models` reader). This is now the **established pattern — any new AI-consuming route must add this gate before charging.** Live in all four AI routes: `agent/run`, `pam/message`, `prompts/structure`, and `wizard/generate` (which gates **per generation step**, since steps can use different models — the check runs inside `runStep`, routed through the existing `step_error`/fatal machinery).
+
 ### Known quirks
 - **Pro-gate on BYOK save/delete** is enforced in the route, not in the UI — UI may let a free user click "save" and get a 403.
 - **`components/ui/`** is deliberately sparse (7 primitives). Don't auto-install shadcn components on a whim.
 - **`.agents/skills/`** folder exists but is empty — legacy scaffolding, safe to ignore.
 - **`CHANGELOG.md` mentions an `.auto-memory/` directory** from a prior memory pass (2026-04-16). It is **not** present on disk — this `CLAUDE.md` replaces it.
+
+### Open issues (known, unresolved)
+- **`app/api/team/respond/route.ts` is written but held uncommitted.** The invitee accept/decline UI doesn't exist, and there is **no automatic pending→accepted conversion** on signup (no DB trigger, no signup-flow claim). A `pending` invite (issued to a not-yet-registered email) currently has **no working resolution path** except the head manually re-inviting after the person signs up — which leaves a stale pending row.
+- **`wizard/generate` discards `deductCost`'s result.** The per-step `try { await deductCost(...) } catch {}` throws the return value away, so its **balance** check is unenforced (a free user with insufficient coins on a free model still generates). The **tier** dimension is now covered by the `canUseModel` gate (fixed); the balance-discard remains open.
 
 ---
 
