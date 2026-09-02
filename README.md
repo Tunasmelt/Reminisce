@@ -10,6 +10,26 @@ Every AI call, every editor session, every teammate — working from the same li
 
 ---
 
+## Why Reminisce
+
+Every AI coding tool starts from zero. You re-paste the same architecture notes, tech
+stack, and conventions into a new chat, a new editor session, a new teammate's setup —
+and the context drifts a little more each time. Reminisce fixes that by treating project
+context as a first-class, versioned artifact: define the idea, architecture, phases, and
+features once through a guided wizard, and every AI call, PAM chat, and agent run pulls
+from that same living source of truth — synced to your local repo via the File System
+Access API, no plugin required.
+
+<p align="center">
+  <img src="public/screenshots/landing.png" alt="Reminisce landing page" width="100%">
+</p>
+
+<p align="center">
+  <img src="public/screenshots/login.png" alt="Reminisce sign-in screen" width="100%">
+</p>
+
+---
+
 ## What it does
 
 | Feature | Description |
