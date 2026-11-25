@@ -1,0 +1,129 @@
+{
+  "protected_branches": [
+    "main"
+  ],
+  "docs_globs": [
+    "docs/**",
+    "*.md"
+  ],
+  "guarded": [
+    ".claude/**",
+    ".harness/**",
+    "vitest.config.js",
+    ".github/**",
+    ".env*"
+  ],
+  "closeout_paths": [
+    "docs/CHANGELOG.md",
+    "docs/HANDOFF.md"
+  ],
+  "secret_patterns": {
+    "anthropic": "sk-ant-[A-Za-z0-9_-]{20,}",
+    "github": "ghp_[A-Za-z0-9]{30,}"
+  },
+  "hard_stops": {
+    "force push": "git\\s+push\\s+.*(--force|-f\\b)",
+    "push to main": "git\\s+push\\s+\\S+\\s+main",
+    "reset --hard": "git\\s+reset\\s+--hard",
+    "rm -rf": "rm\\s+-rf?\\s",
+    "npm publish": "npm\\s+publish"
+  },
+  "packet_max_bytes": 6144,
+  "return_max_bytes": 2048,
+  "spill_max_bytes": 4096,
+  "lock_stale_min": 30,
+  "return_forbidden": [
+    "sk-ant-"
+  ],
+  "freeze_chmod": true,
+  "roles": {
+    "test-writer": {
+      "tools": [
+        "Read",
+        "Grep",
+        "Glob",
+        "Write",
+        "Edit",
+        "Bash(npx vitest run:*)"
+      ],
+      "evidence": [
+        "failing run per mapped id"
+      ]
+    },
+    "feature-dev": {
+      "tools": [
+        "Read",
+        "Grep",
+        "Glob",
+        "Write",
+        "Edit",
+        "Bash(npx vitest run:*)"
+      ],
+      "evidence": [
+        "passing run"
+      ]
+    },
+    "verifier": {
+      "tools": [
+        "Read",
+        "Grep",
+        "Glob"
+      ]
+    },
+    "debugger": {
+      "tools": [
+        "Read",
+        "Grep",
+        "Glob",
+        "Bash(npx vitest run:*)"
+      ]
+    },
+    "planner": {
+      "tools": [
+        "Read",
+        "Grep",
+        "Glob"
+      ]
+    }
+  },
+  "test": {
+    "command": [
+      "node_modules/.bin/vitest",
+      "run",
+      "--reporter=junit",
+      "--outputFile={junit}",
+      "{tests}"
+    ],
+    "cwd": ".",
+    "env_allow": [
+      "PATH",
+      "HOME",
+      "TMPDIR"
+    ],
+    "env_set": {
+      "CI": "1",
+      "NO_COLOR": "1"
+    },
+    "acceptance_globs": [
+      "tests/acceptance/**"
+    ],
+    "unit_globs": [
+      "tests/unit/**"
+    ],
+    "unit_paths": [
+      "tests/unit"
+    ],
+    "frozen_extra": [
+      "vitest.config.js"
+    ],
+    "invalid_red_pattern": "ReferenceError|SyntaxError|Cannot find module|Failed to load url|does not provide an export",
+    "lockfiles": [
+      "package-lock.json"
+    ],
+    "runtime_probe": [
+      "node",
+      "--version"
+    ],
+    "timeout_s": 120
+  }
+}

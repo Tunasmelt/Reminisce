@@ -77,3 +77,4 @@ test-export.zip
 # ─── Agent & Scratch files ────────────────────────────────────
 .agents/
 scratch/
+.harness/
