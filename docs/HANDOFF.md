@@ -1,3 +1,3 @@
 # Handoff
 
-The Stop hook rewrites the auto block below. Read it at session start; never @-import it.
+Use this file for shared handoff notes. The Stop hook saves the local session summary to `.harness/handoff.md`. The SessionStart hook reads both files.

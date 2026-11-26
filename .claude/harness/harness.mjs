@@ -4,7 +4,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { root, loadConfig, H, readJSON, writeJSON, loadState, saveState, sha256File, sha256, git, matchAny } from '../hooks/lib.mjs';
+import { root, loadConfig, H, readJSON, writeJSON, loadState, saveState, sha256File, sha256, git, matchAny, logHit } from '../hooks/lib.mjs';
 import { listFeatures, parseFeature, featurePath, mappedIds, reviewOnly, components, idsInName } from './features.mjs';
 
 const r = root();
@@ -159,7 +159,14 @@ if (cmd === 'brief') {
   if (!roles[role]) say(false, `unknown role ${role}`);
   const errs = analyze().filter(e => e.startsWith(fid + ':'));
   if (errs.length) say(false, 'analyze failed for feature', { errors: errs });
-  if (state.active_run && fs.existsSync(H(r, 'run.lock'))) say(false, `run ${state.active_run.run_id} holds the lock`);
+  const lockFile = H(r, 'run.lock');
+  const lock = readJSON(lockFile, null);
+  if (fs.existsSync(lockFile) && (!lock || !Number.isFinite(lock.ts) || typeof lock.run_id !== 'string')) say(false, 'run lock could not be read');
+  if (lock && Date.now() - lock.ts < (cfg.lock_stale_min || 30) * 60e3) say(false, `run ${lock.run_id} holds the lock`);
+  if (lock && state.active_run?.run_id === lock.run_id) {
+    const interrupted = state.features[lock.feature];
+    if (interrupted?.state === 'red-running' && !interrupted.reopen) transition(state, lock.feature, 'draft', `crash recovery ${lock.run_id}`);
+  }
   const f = parseFeature(r, fid);
   const fs_ = feat(state, fid);
   const need = { 'test-writer': ['draft', 'red-running'], 'feature-dev': ['frozen'], 'debugger': ['frozen', 'verified', 'invalid'], 'verifier': ['verified', 'frozen'] }[role] || ['draft', 'frozen', 'verified'];
@@ -185,6 +192,10 @@ if (cmd === 'brief') {
   else fs_.history.push({ ts: new Date().toISOString(), note: `brief ${role}` });
   state.active_run = { run_id: runId, feature: fid, role, status: 'briefed', agent_id: null, ts: new Date().toISOString() };
   saveState(r, state);
+  if (lock) {
+    fs.rmSync(lockFile, { force: true });
+    logHit(r, 'R-lock-stale', lock.run_id);
+  }
   say(true, 'packet written', { run_id: runId, bytes, path: `.harness/briefs/${runId}.json` });
 }
 

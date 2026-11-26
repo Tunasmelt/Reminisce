@@ -7,7 +7,7 @@ import { readInput, root, loadState, H, git, context, allow } from './lib.mjs';
 const input = readInput();
 const r = root(input);
 const ev = input.hook_event_name;
-const handoff = path.join(r, 'docs', 'HANDOFF.md');
+const handoff = H(r, 'handoff.md');
 const resume = H(r, 'resume.md');
 
 if (ev === 'SessionStart') {
@@ -17,7 +17,9 @@ if (ev === 'SessionStart') {
     context('SessionStart', `Resume note (written before compaction):\n${t}`);
   }
   const parts = [];
-  if (fs.existsSync(handoff)) parts.push(fs.readFileSync(handoff, 'utf8').split('\n').slice(0, 40).join('\n'));
+  for (const file of [path.join(r, 'docs', 'HANDOFF.md'), handoff]) {
+    if (fs.existsSync(file)) parts.push(fs.readFileSync(file, 'utf8').split('\n').slice(0, 40).join('\n'));
+  }
   const init = path.join(r, 'init.sh');
   if (fs.existsSync(init)) {
     const s = spawnSync('bash', [init], { cwd: r, encoding: 'utf8', timeout: 60e3 });
@@ -49,19 +51,18 @@ if (ev === 'PreCompact') {
 if (ev === 'Stop') {
   if (input.stop_hook_active) allow();
   const { st, feats } = summary();
-  const block = [
-    '<!-- auto:start -->',
+  const note = [
+    '# Previous session',
+    '',
     `Updated: ${new Date().toISOString()}`,
     `Branch: ${git(r, ['branch', '--show-current'])} · HEAD ${git(r, ['rev-parse', '--short', 'HEAD'])}`,
     'Last commits:', ...git(r, ['log', '--oneline', '-3']).split('\n').map(l => `- ${l}`),
     'Features:', ...feats,
     `Active run: ${st.active_run ? `${st.active_run.run_id} (${st.active_run.status})` : 'none'}`,
-    '<!-- auto:end -->',
+    '',
   ].join('\n');
-  let t = fs.existsSync(handoff) ? fs.readFileSync(handoff, 'utf8') : '# Handoff\n\n';
-  t = /<!-- auto:start -->[\s\S]*<!-- auto:end -->/.test(t) ? t.replace(/<!-- auto:start -->[\s\S]*<!-- auto:end -->/, block) : `${t.trimEnd()}\n\n${block}\n`;
   fs.mkdirSync(path.dirname(handoff), { recursive: true });
-  fs.writeFileSync(handoff, t);
+  fs.writeFileSync(handoff, note);
   allow();
 }
 

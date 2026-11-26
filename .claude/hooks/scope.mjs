@@ -11,6 +11,9 @@ const ti = input.tool_input || {};
 const no = (rule, msg) => { logHit(r, rule, tool); deny(`[harness ${rule}] ${msg}`); };
 
 if (!pk) no('R-no-packet', 'no active packet for this worker. The orchestrator must run /brief first.');
+if (state.active_run.status !== 'running' || state.active_run.agent_id !== input.agent_id) {
+  no('R-no-packet', 'the active packet belongs to a different run.');
+}
 
 const entries = pk.allowed_tools.map(t => { const m = t.match(/^(\w+)\((.*)\)$/); return m ? { name: m[1], prefix: m[2].replace(/:\*$/, '') } : { name: t }; });
 const forTool = entries.filter(e => e.name === tool);
