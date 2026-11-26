@@ -105,14 +105,15 @@ function runTests(f, runId, unit = false) {
   const env = {};
   for (const k of cfg.test.env_allow || []) if (process.env[k] !== undefined) env[k] = process.env[k];
   Object.assign(env, cfg.test.env_set || {});
-  const res = spawnSync(argv[0], argv.slice(1), { cwd: path.join(r, cfg.test.cwd || '.'), env, encoding: 'utf8', timeout: (cfg.test.timeout_s || 300) * 1000 });
-  fs.writeFileSync(path.join(outDir, 'stdout.txt'), (res.stdout || '') + '\n--- stderr ---\n' + (res.stderr || ''));
+  const executable = argv[0] === 'node' ? process.execPath : argv[0];
+  const res = spawnSync(executable, argv.slice(1), { cwd: path.join(r, cfg.test.cwd || '.'), env, encoding: 'utf8', timeout: (cfg.test.timeout_s || 300) * 1000 });
+  fs.writeFileSync(path.join(outDir, unit ? 'stdout-unit.txt' : 'stdout.txt'), (res.stdout || '') + '\n--- stderr ---\n' + (res.stderr || '') + (res.error ? '\n' + res.error.message : ''));
   const xml = fs.existsSync(junit) ? fs.readFileSync(junit, 'utf8') : '';
   const cases = parseJunit(xml);
   const meta = {
     command: argv.join(' '), cwd: cfg.test.cwd || '.', exit: res.status, ran_at: new Date().toISOString(),
     lockfile_hash: (cfg.test.lockfiles || []).map(l => sha256File(path.join(r, l)) || 'absent').join(','),
-    runtime: cfg.test.runtime_probe ? spawnSync(cfg.test.runtime_probe[0], cfg.test.runtime_probe.slice(1), { encoding: 'utf8' }).stdout.trim() : process.version,
+    runtime: process.version,
     parser: PARSER_VERSION, junit: path.relative(r, junit), files,
   };
   return { cases, meta, junitFound: Boolean(xml) };
@@ -191,9 +192,11 @@ if (cmd === 'record-red') {
   const fs_ = feat(state, fid);
   if (fs_.state !== 'red-running') say(false, `record-red needs red-running, feature is ${fs_.state}`);
   const f = parseFeature(r, fid);
+  if (!testFiles(f).length) say(false, 'no acceptance test files found for this feature');
   const runId = `${fid}-red-${Date.now()}`;
   const { cases, meta, junitFound } = runTests(f, runId);
   if (!junitFound) say(false, 'runner produced no JUnit report (collection or config error)', { meta });
+  if (meta.exit !== 1) say(false, 'red requires the test runner to exit with code 1', { meta });
   const prev = fs_.baseline_id ? readJSON(H(r, 'baselines', fs_.baseline_id, 'baseline.json'), null) : null;
   const prevKeys = new Set(prev ? prev.tests.map(t => t.key) : []);
   const broken = new Set(fs_.reopen?.broken || []);
@@ -264,10 +267,10 @@ if (cmd === 'verify') {
   let unit = { ran: false };
   if ((cfg.test.unit_paths || []).some(p => fs.existsSync(path.join(r, p)))) {
     const u = runTests(f, runId, true);
-    unit = { ran: true, report: u.junitFound, passed: u.cases.filter(c => c.outcome === 'pass').length, failed: u.cases.filter(c => c.outcome === 'failure' || c.outcome === 'error').length, skipped: u.cases.filter(c => c.outcome === 'skipped').length, command: u.meta.command };
+    unit = { ran: true, report: u.junitFound, exit: u.meta.exit, passed: u.cases.filter(c => c.outcome === 'pass').length, failed: u.cases.filter(c => c.outcome === 'failure' || c.outcome === 'error').length, skipped: u.cases.filter(c => c.outcome === 'skipped').length, command: u.meta.command };
   }
-  const unitOk = !unit.ran || (unit.report && unit.failed === 0);
-  const green = unitOk && junitFound && counts.failed === 0 && counts.skipped === 0 && missingTests.length === 0 && Object.values(results).every(v => v === 'pass');
+  const unitOk = !unit.ran || (unit.exit === 0 && unit.report && unit.failed === 0);
+  const green = unitOk && meta.exit === 0 && junitFound && counts.failed === 0 && counts.skipped === 0 && missingTests.length === 0 && Object.values(results).every(v => v === 'pass');
   const status = readJSON(H(r, 'status.json'), {});
   status[fid] = {
     feature_rev: featureRev(fid), baseline_id: b.baseline_id, frozen_hash: b.frozen_hash,

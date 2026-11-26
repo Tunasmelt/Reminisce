@@ -1,6 +1,7 @@
 {
   "protected_branches": [
-    "main"
+    "main",
+    "master"
   ],
   "docs_globs": [
     "docs/**",
@@ -23,7 +24,7 @@
   },
   "hard_stops": {
     "force push": "git\\s+push\\s+.*(--force|-f\\b)",
-    "push to main": "git\\s+push\\s+\\S+\\s+main",
+    "push to default branch": "git\\s+push\\s+\\S+\\s+(?:main|master)\\b",
     "reset --hard": "git\\s+reset\\s+--hard",
     "rm -rf": "rm\\s+-rf?\\s",
     "npm publish": "npm\\s+publish"
@@ -88,7 +89,8 @@
   },
   "test": {
     "command": [
-      "node_modules/.bin/vitest",
+      "node",
+      "node_modules/vitest/vitest.mjs",
       "run",
       "--reporter=junit",
       "--outputFile={junit}",
@@ -119,10 +121,6 @@
     "invalid_red_pattern": "ReferenceError|SyntaxError|Cannot find module|Failed to load url|does not provide an export",
     "lockfiles": [
       "package-lock.json"
-    ],
-    "runtime_probe": [
-      "node",
-      "--version"
     ],
     "timeout_s": 120
   }

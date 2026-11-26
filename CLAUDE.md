@@ -1,11 +1,13 @@
-# Reminisce Gemini rework — Gemini-only AI layer, File manifest, markdown rework
+# Reminisce
+
+OpenRouter remains the project standard for server-side AI calls. The Gemini rework in `docs/SPEC.md` is a draft proposal. Wait for approval and an update to the project instructions before starting its phases.
 
 Map, not manual. Read `docs/HANDOFF.md` with the Read tool at session start; never @-import it.
 
 ## Rules (each with its check)
 | Rule | Check |
 |---|---|
-| No code edits on main | hook: edit_guard R-branch |
+| No code edits on the default branch | hook: edit_guard R-branch |
 | Never edit hooks, harness config, `.harness/` state | hook: edit_guard R-guarded, bash_guard |
 | Acceptance tests (`tests/acceptance/**`) are frozen after red; a wrong one → return `needs-red-reopen` + ISS | hook: edit_guard R-frozen, bash_guard R-bash-detect |
 | Unit tests (`tests/unit/**`): one test, then just enough code, one slice at a time, through agreed interfaces; editable; must be green at verify | runner: `harness verify` (unit suite) + review |
@@ -34,3 +36,5 @@ End with: *DO THIS* block → concrete next actions for user, numbered, priority
 
 ## Commands
 `node .claude/harness/harness.mjs analyze | brief FEAT role | record-red FEAT | freeze FEAT | verify FEAT | reopen-red FEAT --iss ISS-N --reason ".." --confirm | restore FEAT | accept FEAT | status`
+
+`analyze` and `status` run with Node alone. The red and verify commands require Vitest installed locally and the mapped test files. The kickoff includes the spec and harness, and leaves test setup and implementation to the approved phases.

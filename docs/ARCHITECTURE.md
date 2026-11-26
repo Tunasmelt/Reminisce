@@ -1,5 +1,7 @@
 # Architecture
 
+Proposed architecture for the Gemini rework in `SPEC.md`.
+
 Stack: see SPEC.md Tech stack.
 
 | ID | Component | Allowed imports |

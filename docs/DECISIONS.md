@@ -2,6 +2,8 @@
 
 Append-only. Supersede, never edit.
 
+The ADRs below belong to the draft Gemini proposal in `SPEC.md` and are pending approval.
+
 ## ADR-001 — Gemini only
 - Context: ten providers, per-model cascades and an OpenRouter fallback make the AI layer large and fragile.
 - Decision: all generation and embeddings use Gemini. BYOK keys are Gemini-only.

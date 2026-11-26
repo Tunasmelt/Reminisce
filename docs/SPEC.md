@@ -1,5 +1,7 @@
 # Reminisce Gemini rework — SPEC
 
+**Draft proposal.** The existing project instructions require server-side OpenRouter. Implementation of this proposal requires approval and updated project instructions.
+
 ## Intent
 Rework Reminisce so every AI call goes through one Gemini client with a Rate guard, models come from a static config, the FileAPI is driven by a single File manifest taken from the Prompt library's markdown list, and all repo markdown and templates follow current standards. Dead provider code and known bugs are cleaned up in the same pass.
 

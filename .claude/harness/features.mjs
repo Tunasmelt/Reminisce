@@ -14,7 +14,7 @@ export function parseFeature(r, id) {
   const text = fs.readFileSync(featurePath(r, id), 'utf8');
   const sections = {};
   let cur = '_';
-  for (const line of text.split('\n')) {
+  for (const line of text.split(/\r?\n/)) {
     const h = line.match(/^##\s+(.+?)\s*$/);
     if (h) { cur = h[1].toLowerCase(); sections[cur] = []; continue; }
     (sections[cur] ||= []).push(line);
